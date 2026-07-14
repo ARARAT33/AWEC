@@ -1,1197 +1,376 @@
 #!/usr/bin/env python3
-"""
-AWEC Production Crawler – Self‑expanding URL collector, 24/7 ready.
-Optimized for GitHub Actions (Thread-safe SQLite & Asynchronous Deadlock Prevention).
-"""
 import asyncio
 import aiohttp
 import hashlib
-import json
 import logging
-import math
 import os
-import random
-import re
-import sqlite3
 import sys
 import time
-import zlib
-from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from io import BytesIO
-from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import (parse_qs, urlencode, urldefrag, urljoin, urlparse,
-                          urlunparse, quote)
+import sqlite3
+import shutil
+import warnings
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin, urlparse, urldefrag
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
-import gzip
-from bs4 import BeautifulSoup
-from lxml import etree
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION
+# CONFIGURATION
 # ---------------------------------------------------------------------------
-@dataclass
 class Config:
-    db_path: str = "links.db"
-    log_file: str = "logs/crawler.log"
-    max_workers: int = 100              # Օպտիմալացված GitHub Actions-ի համար
-    max_queue_size: int = 150_000
-    max_depth: int = 100
-    request_timeout: int = 8
-    max_retries: int = 3
-    backoff_base: float = 1.5
-    batch_size: int = 1000              # Ավելի փոքր խմբեր՝ արագ թարմացման համար
-    flush_interval: float = 30.0        # Ավելի արագ flush
-    bloom_size: int = 500_000_000
-    bloom_hashes: int = 7
-    commoncrawl_interval: int = 3600
-    cdx_interval: int = 1800
-    crtsh_interval: int = 600
-    github_interval: int = 900
-    sitemap_interval: int = 300
-    rss_interval: int = 300
-    dataset_interval: int = 7200
-    wikipedia_interval: int = 7200
-    ia_access: str = os.getenv("IA_ACCESS_KEY", "")
-    ia_secret: str = os.getenv("IA_SECRET_KEY", "")
-    job_hours: float = 5.0              # 5 ժամ աշխատանքային ցիկլ
-    dns_cache_ttl: int = 300
-    log_level: str = "INFO"
-    stats_interval: int = 60            # Ստատիստիկան՝ ամեն րոպե
-
-    @property
-    def deadline(self) -> float:
-        return time.time() + self.job_hours * 3600
-
+    db_path = "links.db"
+    log_file = "logs/crawler.log"
+    max_workers = 120
+    max_queue_size = 150_000
+    request_timeout = 7
+    flush_interval = 60.0  # 1 րոպեն մեկ flush
+    
+    # Internet Archive Credentials (GitHub Secrets)
+    ia_access_key = os.environ.get("IA_ACCESS_KEY")
+    ia_secret_key = os.environ.get("IA_SECRET_KEY")
+    ia_identifier = "awec_links_awe_o.s"  # Քո կոնկրետ էջը
 
 # ---------------------------------------------------------------------------
-# 2. LOGGER
+# LOGGER SETUP
 # ---------------------------------------------------------------------------
-def setup_logger(cfg: Config) -> logging.Logger:
-    os.makedirs("logs", exist_ok=True)
-    logger = logging.getLogger("awec")
-    logger.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    fh = logging.FileHandler(cfg.log_file)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-    return logger
+os.makedirs("logs", exist_ok=True)
+logger = logging.getLogger("awec")
+logger.setLevel(logging.INFO)
+fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
+fh = logging.FileHandler(Config.log_file)
+fh.setFormatter(fmt)
+logger.addHandler(fh)
 
-# ---------------------------------------------------------------------------
-# 3. BLOOM FILTER
-# ---------------------------------------------------------------------------
-class BloomFilter:
-    def __init__(self, size: int, hash_count: int) -> None:
-        self.size = size
-        self.hash_count = hash_count
-        self.bit_array = bytearray((size + 7) // 8)
-        self._lock = asyncio.Lock()
-
-    def _hashes(self, item: str) -> List[int]:
-        h1 = int(hashlib.md5(item.encode()).hexdigest(), 16)
-        h2 = int(hashlib.sha1(item.encode()).hexdigest(), 16)
-        return [(h1 + i * h2) % self.size for i in range(self.hash_count)]
-
-    def add(self, item: str) -> None:
-        for h in self._hashes(item):
-            self.bit_array[h // 8] |= (1 << (h % 8))
-
-    def contains(self, item: str) -> bool:
-        return all(self.bit_array[h // 8] & (1 << (h % 8))
-                   for h in self._hashes(item))
-
-    async def add_async(self, item: str) -> None:
-        async with self._lock:
-            self.add(item)
-
-    async def contains_async(self, item: str) -> bool:
-        async with self._lock:
-            return self.contains(item)
-
-    def estimate_count(self) -> int:
-        bits_set = sum(bin(b).count('1') for b in self.bit_array)
-        if bits_set == 0:
-            return 0
-        return int(-(self.size / self.hash_count) *
-                   math.log(1.0 - bits_set / self.size))
-
+sh = logging.StreamHandler(sys.stdout)
+sh.setFormatter(fmt)
+logger.addHandler(sh)
 
 # ---------------------------------------------------------------------------
-# 4. URL NORMALIZER
-# ---------------------------------------------------------------------------
-class URLNormalizer:
-    TRACKING = {
-        'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
-        'utm_id', 'fbclid', 'gclid', 'gclsrc', 'dclid', 'msclkid', 'twclid',
-        'igshid', 'mc_cid', 'mc_eid', '_ga', '_gl', 'ref', 'referrer',
-        'source', 'campaign', 'affiliate', 'session_id', 'trk', 'cid', 'sid', 'pid'
-    }
-
-    @staticmethod
-    def normalize(url: str) -> Optional[str]:
-        if not url or len(url) > 6000:
-            return None
-        try:
-            url, _ = urldefrag(url.strip())
-            parsed = urlparse(url)
-            scheme = parsed.scheme.lower()
-            if scheme not in ('http', 'https', 'ftp', 'ftps', 'ssh', 'git',
-                              'svn', 'ws', 'wss', 'magnet', 'ipfs', 'ipns'):
-                if scheme:
-                    return None
-                url = f"https://{url}"
-                parsed = urlparse(url)
-                scheme = 'https'
-            netloc = parsed.netloc.lower()
-            if netloc.startswith('www.'):
-                netloc = netloc[4:]
-            if ':' in netloc:
-                host, port = netloc.rsplit(':', 1)
-                if (scheme == 'http' and port == '80') or \
-                   (scheme == 'https' and port == '443'):
-                    netloc = host
-            path = parsed.path or '/'
-            path = re.sub(r'/+', '/', path)
-            if len(path) > 1 and path.endswith('/'):
-                path = path[:-1]
-            query = ''
-            if parsed.query:
-                params = parse_qs(parsed.query, keep_blank_values=False)
-                clean = {k: v for k, v in params.items()
-                         if k.lower() not in URLNormalizer.TRACKING}
-                if clean:
-                    query = urlencode(clean, doseq=True)
-            normalized = urlunparse((scheme, netloc, path, parsed.params, query, ''))
-            if len(normalized) < 10:
-                return None
-            if normalized.lower().startswith(('javascript:', 'data:', 'mailto:', 'tel:', 'sms:')):
-                return None
-            return normalized
-        except Exception:
-            return None
-
-    @staticmethod
-    def get_domain(url: str) -> str:
-        try:
-            return urlparse(url).netloc.lower()
-        except Exception:
-            return ""
-
-    @staticmethod
-    def get_path(url: str) -> str:
-        try:
-            return urlparse(url).path or '/'
-        except Exception:
-            return '/'
-
-
-# ---------------------------------------------------------------------------
-# 5. DATABASE (Thread-Safe Wrapper with to_thread)
+# DATABASE (Thread-Safe SQLite)
 # ---------------------------------------------------------------------------
 class Database:
-    def __init__(self, cfg: Config, logger: logging.Logger) -> None:
+    def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.logger = logger
-        self.conn = sqlite3.connect(cfg.db_path, check_same_thread=False)
-        self._optimize()
-        self._create_tables()
-        self.bloom = BloomFilter(cfg.bloom_size, cfg.bloom_hashes)
-        self._load_bloom()
-        self._buffer: List[Dict[str, Any]] = []
+        self.conn = None
+        self._db_lock = asyncio.Lock()
+        self._buffer = []
         self._buf_lock = asyncio.Lock()
-        self._db_lock = asyncio.Lock() # Thread synchronization lock
-        self._last_flush = time.time()
+        self.connect()
 
-    def _optimize(self) -> None:
+    def connect(self):
+        self.conn = sqlite3.connect(self.cfg.db_path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA cache_size=-200000")
-        self.conn.execute("PRAGMA temp_store=MEMORY")
         self.conn.execute("PRAGMA busy_timeout=15000")
-
-    def _create_tables(self) -> None:
-        self.conn.executescript("""
+        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS urls (
                 url TEXT PRIMARY KEY,
-                url_hash TEXT,
-                domain TEXT,
-                path TEXT,
-                depth INTEGER DEFAULT 0,
-                parent_url TEXT,
-                source TEXT DEFAULT 'unknown',
                 status TEXT DEFAULT 'pending',
-                first_seen TEXT,
-                last_seen TEXT,
-                content_type TEXT,
-                content_hash TEXT,
-                error_count INTEGER DEFAULT 0,
-                priority REAL DEFAULT 1.0
-            );
-            CREATE INDEX IF NOT EXISTS idx_status ON urls(status);
-            CREATE INDEX IF NOT EXISTS idx_domain ON urls(domain);
-            CREATE INDEX IF NOT EXISTS idx_priority ON urls(priority DESC);
-            CREATE TABLE IF NOT EXISTS crash_recovery (
-                id INTEGER PRIMARY KEY,
-                last_url TEXT,
-                last_time TEXT
-            );
+                source TEXT DEFAULT 'unknown'
+            )
         """)
         self.conn.commit()
 
-    def _load_bloom(self) -> None:
-        cur = self.conn.execute("SELECT url FROM urls")
-        cnt = 0
-        for (url,) in cur:
-            self.bloom.add(url)
-            cnt += 1
-        self.logger.info("Bloom filter loaded with %d URLs", cnt)
-
-    async def insert_batch(self, url_dicts: List[Dict[str, Any]]) -> int:
+    async def insert_many(self, urls: list, source: str = 'crawled'):
         async with self._buf_lock:
-            self._buffer.extend(url_dicts)
-            if len(self._buffer) >= self.cfg.batch_size:
-                return await self._flush()
-        return 0
+            for u in urls:
+                self._buffer.append((u, source))
 
-    async def _flush(self) -> int:
-        async with self._db_lock:
+    async def flush(self):
+        async with self._buf_lock:
             if not self._buffer:
-                return 0
-            # Կատարում ենք բազայի գրառումը սերվերի առանձին Thread-ում, որպեսզի Event Loop-ը չսառչի
-            inserted = await asyncio.to_thread(self._sync_flush, list(self._buffer))
+                return
+            to_write = list(self._buffer)
             self._buffer.clear()
-            self._last_flush = time.time()
-            return inserted
 
-    def _sync_flush(self, buffer_to_write: List[Dict[str, Any]]) -> int:
-        now = datetime.now(timezone.utc).isoformat()
-        inserted = 0
-        for d in buffer_to_write:
-            url = d['url']
+        async with self._db_lock:
+            await asyncio.to_thread(self._sync_write, to_write)
+
+    def _sync_write(self, data):
+        for url, src in data:
             try:
                 self.conn.execute(
-                    """INSERT OR IGNORE INTO urls
-                       (url, url_hash, domain, path, depth, parent_url, source,
-                        status, first_seen, last_seen, priority)
-                       VALUES (?,?,?,?,?,?,?,'pending',?,?,?)""",
-                    (url,
-                     hashlib.sha256(url.encode()).hexdigest()[:16],
-                     d.get('domain', ''),
-                     d.get('path', ''),
-                     d.get('depth', 0),
-                     d.get('parent_url', ''),
-                     d.get('source', 'unknown'),
-                     now, now,
-                     d.get('priority', 1.0))
+                    "INSERT OR IGNORE INTO urls (url, status, source) VALUES (?, 'pending', ?)",
+                    (url, src)
                 )
-                self.bloom.add(url)
-                inserted += 1
-            except sqlite3.IntegrityError:
-                continue
-            except Exception as exc:
-                self.logger.debug("Insert error for %s: %s", url[:80], exc)
+            except Exception:
+                pass
         self.conn.commit()
-        if buffer_to_write:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO crash_recovery (id, last_url, last_time) VALUES (1,?,?)",
-                (buffer_to_write[-1]['url'], now))
-            self.conn.commit()
-        return inserted
 
-    async def periodic_flush(self) -> None:
-        while True:
-            await asyncio.sleep(self.cfg.flush_interval)
-            async with self._buf_lock:
-                if self._buffer:
-                    await self._flush()
-
-    async def get_pending(self, limit: int = 2000) -> List[Dict[str, Any]]:
+    async def get_pending(self, limit=3000) -> list:
         async with self._db_lock:
-            # get_pending-ը նույնպես աշխատեցնում ենք Thread-ում՝ սառեցումներից խուսափելու համար
             return await asyncio.to_thread(self._sync_get_pending, limit)
 
-    def _sync_get_pending(self, limit: int) -> List[Dict[str, Any]]:
-        now = datetime.now(timezone.utc).isoformat()
+    def _sync_get_pending(self, limit):
         rows = self.conn.execute(
-            """SELECT url, depth, priority FROM urls
-               WHERE status='pending'
-               ORDER BY priority DESC, first_seen ASC
-               LIMIT ?""", (limit,)).fetchall()
-        for (url, _, _) in rows:
-            self.conn.execute(
-                "UPDATE urls SET status='in_progress', last_seen=? WHERE url=?",
-                (now, url))
+            "SELECT url FROM urls WHERE status='pending' LIMIT ?", (limit,)
+        ).fetchall()
+        for (url,) in rows:
+            self.conn.execute("UPDATE urls SET status='visited' WHERE url=?", (url,))
         self.conn.commit()
-        return [{'url': r[0], 'depth': r[1], 'priority': r[2]} for r in rows]
+        return [r[0] for r in rows]
 
-    async def mark_visited(self, url: str, success: bool = True,
-                           content_type: str = '', content_hash: str = '') -> None:
-        async with self._db_lock:
-            await asyncio.to_thread(self._sync_mark_visited, url, success, content_type, content_hash)
-
-    def _sync_mark_visited(self, url: str, success: bool, content_type: str, content_hash: str) -> None:
-        now = datetime.now(timezone.utc).isoformat()
-        status = 'visited' if success else 'failed'
-        self.conn.execute(
-            "UPDATE urls SET status=?, last_seen=?, content_type=?, content_hash=? WHERE url=?",
-            (status, now, content_type, content_hash, url))
-        if not success:
-            self.conn.execute(
-                "UPDATE urls SET error_count=error_count+1 WHERE url=?", (url,))
-        self.conn.commit()
-
-    def total_urls(self) -> int:
-        return self.conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
-
-    def top_domains(self, limit: int = 20) -> List[Tuple[str, int]]:
-        return self.conn.execute(
-            "SELECT domain, COUNT(*) cnt FROM urls WHERE domain!='' "
-            "GROUP BY domain ORDER BY cnt DESC LIMIT ?", (limit,)).fetchall()
-
-    def close(self) -> None:
-        self.conn.commit()
-        self.conn.close()
-
-
-# ---------------------------------------------------------------------------
-# 6. FETCHER
-# ---------------------------------------------------------------------------
-class Fetcher:
-    def __init__(self, cfg: Config, logger: logging.Logger) -> None:
-        self.cfg = cfg
-        self.logger = logger
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.requests = 0
-        self.errors = 0
-        self.timeouts = 0
-        self.bytes_dl = 0
-
-    async def start(self) -> None:
-        connector = aiohttp.TCPConnector(
-            limit=0, limit_per_host=0,
-            ttl_dns_cache=self.cfg.dns_cache_ttl,
-            force_close=True)
-        timeout = aiohttp.ClientTimeout(total=self.cfg.request_timeout)
-        self.session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            headers={
-                'User-Agent': 'AWEC/8.0 (Planetary Web Crawler)',
-                'Accept': '*/*',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Accept-Language': 'en-US,en;q=0.9'
-            })
-
-    async def stop(self) -> None:
-        if self.session:
-            await self.session.close()
-
-    async def fetch(self, url: str, retry: int = 0) -> Optional[Dict[str, Any]]:
-        self.requests += 1
+    def total_count(self) -> int:
         try:
-            async with self.session.get(url, allow_redirects=True,
-                                       max_redirects=5, ssl=False) as resp:
-                if resp.status == 200:
-                    ct = resp.headers.get('Content-Type', '').lower()
-                    data = await resp.read()
-                    self.bytes_dl += len(data)
-                    text = await self._decompress(data, resp.headers.get('Content-Encoding', ''))
-                    return {
-                        'url': str(resp.url),
-                        'content_type': ct,
-                        'text': text,
-                        'hash': hashlib.sha256(data).hexdigest(),
-                        'size': len(data)
-                    }
-                elif resp.status in (429, 503, 502) and retry < self.cfg.max_retries:
-                    await asyncio.sleep(self.cfg.backoff_base ** retry)
-                    return await self.fetch(url, retry + 1)
-        except asyncio.TimeoutError:
-            self.timeouts += 1
-            if retry < self.cfg.max_retries:
-                await asyncio.sleep(self.cfg.backoff_base ** retry)
-                return await self.fetch(url, retry + 1)
-        except aiohttp.ClientError as exc:
-            self.errors += 1
-            self.logger.debug("Client error %s: %s", url[:100], exc)
-        except Exception as exc:
-            self.errors += 1
-            self.logger.debug("Fetch error %s: %s", url[:100], exc)
-        return None
-
-    async def _decompress(self, data: bytes, encoding: str) -> str:
-        try:
-            if encoding == 'gzip' or data[:2] == b'\x1f\x8b':
-                return gzip.decompress(data).decode('utf-8', 'ignore')
-            elif encoding == 'deflate':
-                return zlib.decompress(data).decode('utf-8', 'ignore')
-            elif encoding == 'br':
-                try:
-                    import brotli
-                    return brotli.decompress(data).decode('utf-8', 'ignore')
-                except ImportError:
-                    pass
-            return data.decode('utf-8', 'ignore')
+            return self.conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
         except Exception:
-            return data.decode('utf-8', 'ignore')
-
-
-# ---------------------------------------------------------------------------
-# 7. PARSER (HTML, JSON, XML, CSS, JS, text, sitemap, rss)
-# ---------------------------------------------------------------------------
-class Parser:
-    URL_RE = re.compile(r"""
-        (?:https?|ftp|ftps|ssh|git|svn|ws|wss|magnet|ipfs|ipns)
-        ://[^\s<>"'\{\}\[\]\\^`|]+
-        |
-        \b[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}
-        (?:/[^\s<>"'\{\}\[\]\\^`|]*)?
-        |
-        \b[a-z2-7]{16,56}\.onion\b
-        |
-        magnet:\?xt=urn:[^\s<>"'\{\}\[\]\\^`|]+
-        |
-        \b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?(?:/[^\s<>"'\{\}\[\]\\^`|]*)?
-    """, re.IGNORECASE | re.VERBOSE)
-
-    CSS_URL = re.compile(r'url\(\s*["\']?([^"\'()\s]+)["\']?\s*\)', re.IGNORECASE)
-
-    @staticmethod
-    def extract_all(text: str, base: str = '') -> Set[str]:
-        if not text:
-            return set()
-        urls: Set[str] = set()
-        for m in Parser.URL_RE.finditer(text):
-            u = m.group(0).rstrip('.,;:)>')
-            if u:
-                urls.add(u)
-        for m in Parser.CSS_URL.finditer(text):
-            u = m.group(1).strip('\'"')
-            if u and not u.startswith('data:'):
-                urls.add(u)
-        return Parser._resolve(urls, base)
-
-    @staticmethod
-    def html(text: str, base: str) -> Set[str]:
-        urls: Set[str] = set()
-        try:
-            soup = BeautifulSoup(text, 'lxml')
-            for tag in soup.find_all(['a', 'link', 'script', 'img', 'iframe',
-                                      'embed', 'object', 'video', 'audio', 'source']):
-                for attr in ('href', 'src', 'data', 'srcset'):
-                    val = tag.get(attr)
-                    if not val:
-                        continue
-                    if attr == 'srcset':
-                        for part in val.split(','):
-                            u = part.strip().split()[0]
-                            if u:
-                                urls.add(u)
-                    else:
-                        urls.add(val)
-            for tag in soup.find_all('meta', attrs={'http-equiv': 'refresh'}):
-                content = tag.get('content', '')
-                m = re.search(r'url=([^;]+)', content, re.IGNORECASE)
-                if m:
-                    urls.add(m.group(1))
-            for tag in soup.find_all('form', action=True):
-                urls.add(tag['action'])
-        except Exception:
-            pass
-        return Parser._resolve(urls, base)
-
-    @staticmethod
-    def json_parse(text: str, base: str) -> Set[str]:
-        try:
-            data = json.loads(text)
-            return Parser.extract_all(json.dumps(data), base)
-        except Exception:
-            return set()
-
-    @staticmethod
-    def xml(text: str, base: str) -> Set[str]:
-        urls: Set[str] = set()
-        try:
-            root = etree.fromstring(text.encode('utf-8', 'ignore'))
-            for elem in root.iter():
-                if elem.text:
-                    urls.update(Parser.URL_RE.findall(elem.text))
-                for key, val in elem.attrib.items():
-                    if val and any(kw in key.lower() for kw in ('url', 'href', 'src', 'link', 'loc')):
-                        urls.add(val)
-        except Exception:
-            pass
-        return Parser._resolve(urls, base)
-
-    @staticmethod
-    def sitemap(text: str) -> Set[str]:
-        urls: Set[str] = set()
-        try:
-            root = etree.fromstring(text.encode('utf-8', 'ignore'))
-            ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-            for loc in root.findall('.//sm:loc', ns):
-                if loc.text:
-                    urls.add(loc.text.strip())
-            for sm in root.findall('.//sm:sitemap/sm:loc', ns):
-                if sm.text:
-                    urls.add(sm.text.strip())
-        except Exception:
-            pass
-        return urls
-
-    @staticmethod
-    def rss(text: str) -> Set[str]:
-        urls: Set[str] = set()
-        try:
-            root = etree.fromstring(text.encode('utf-8', 'ignore'))
-            for link in root.findall('.//link'):
-                if link.text:
-                    urls.add(link.text.strip())
-            for enc in root.findall('.//enclosure'):
-                u = enc.get('url', '')
-                if u:
-                    urls.add(u)
-            ns = {'atom': 'http://www.w3.org/2005/Atom'}
-            for link in root.findall('.//atom:link', ns):
-                href = link.get('href', '')
-                if href:
-                    urls.add(href)
-        except Exception:
-            pass
-        return urls
-
-    @staticmethod
-    def _resolve(urls: Set[str], base: str) -> Set[str]:
-        resolved: Set[str] = set()
-        for u in urls:
-            if not u:
-                continue
-            if base and not urlparse(u).netloc:
-                try:
-                    u = urljoin(base, u)
-                except Exception:
-                    pass
-            resolved.add(u)
-        return resolved
-
-
-# ---------------------------------------------------------------------------
-# 8. DISCOVERY MODULES
-# ---------------------------------------------------------------------------
-class CommonCrawlImporter:
-    INDEXES = [
-        f"https://data.commoncrawl.org/cc-index/collections/CC-MAIN-2024-{w:02d}/indexes/cdx-00000.gz"
-        for w in [10, 18, 26, 34, 42, 50]
-    ] + [
-        "https://data.commoncrawl.org/cc-index/collections/CC-MAIN-2025-05/indexes/cdx-00000.gz",
-    ]
-
-    def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.cfg = cfg
-        self.logger = logger
-        self.last_run = 0.0
-
-    async def run(self) -> int:
-        if time.time() - self.last_run < self.cfg.commoncrawl_interval:
             return 0
-        self.last_run = time.time()
-        total = 0
-        for idx in self.INDEXES:
-            res = await self.fetcher.fetch(idx)
-            if res and res['text']:
-                urls: Set[str] = set()
-                for line in res['text'].split('\n')[:10000]: # Փոքրացրել ենք ծավալը Actions-ի համար
-                    parts = line.split(' ')
-                    if len(parts) >= 3:
-                        raw = parts[2] if parts[2].startswith('http') else 'https://' + parts[2]
-                        norm = URLNormalizer.normalize(raw)
-                        if norm:
-                            urls.add(norm)
-                data = [{'url': u, 'domain': URLNormalizer.get_domain(u),
-                         'path': URLNormalizer.get_path(u), 'depth': 0,
-                         'parent_url': idx, 'source': 'commoncrawl', 'priority': 5.0}
-                        for u in urls]
-                total += await self.db.insert_batch(data)
-        if total:
-            self.logger.info("CommonCrawl: +%d URLs", total)
-        return total
 
-
-class CDXImporter:
-    DOMAINS = ['wikipedia.org', 'github.com', 'stackoverflow.com', 'reddit.com']
-
-    def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.cfg = cfg
-        self.logger = logger
-        self.last_run = 0.0
-
-    async def run(self) -> int:
-        if time.time() - self.last_run < self.cfg.cdx_interval:
-            return 0
-        self.last_run = time.time()
-        total = 0
-        for dom in self.DOMAINS:
-            cdx = f"https://web.archive.org/cdx/search/cdx?url={dom}/*&output=text&fl=original&limit=1000"
-            res = await self.fetcher.fetch(cdx)
-            if res and res['text']:
-                urls: Set[str] = set()
-                for line in res['text'].split('\n'):
-                    if line.startswith('http'):
-                        norm = URLNormalizer.normalize(line.strip())
-                        if norm:
-                            urls.add(norm)
-                data = [{'url': u, 'domain': URLNormalizer.get_domain(u),
-                         'path': URLNormalizer.get_path(u), 'depth': 0,
-                         'parent_url': cdx, 'source': 'cdx', 'priority': 4.0}
-                        for u in urls]
-                total += await self.db.insert_batch(data)
-        if total:
-            self.logger.info("CDX: +%d URLs", total)
-        return total
-
-
-class CrtShDiscovery:
-    DOMAINS = ['google.com', 'github.com', 'cloudflare.com']
-
-    def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.cfg = cfg
-        self.logger = logger
-        self.last_run = 0.0
-
-    async def run(self) -> int:
-        if time.time() - self.last_run < self.cfg.crtsh_interval:
-            return 0
-        self.last_run = time.time()
-        total = 0
-        for dom in self.DOMAINS:
-            url = f"https://crt.sh/?q=%25.{dom}&output=json"
-            res = await self.fetcher.fetch(url)
-            if res and res['text']:
-                try:
-                    data = json.loads(res['text'])
-                    subs: Set[str] = set()
-                    for entry in data[:100]: # Սահմանափակում արագության համար
-                        for name in entry.get('name_value', '').split('\n'):
-                            name = name.strip()
-                            if name and '*' not in name:
-                                u = f"https://{name}"
-                                norm = URLNormalizer.normalize(u)
-                                if norm:
-                                    subs.add(norm)
-                    batch = [{'url': u, 'domain': URLNormalizer.get_domain(u),
-                              'path': '/', 'depth': 0,
-                              'parent_url': f'crtsh://{dom}', 'source': 'crtsh', 'priority': 6.0}
-                             for u in subs]
-                    total += await self.db.insert_batch(batch)
-                except json.JSONDecodeError:
-                    pass
-        if total:
-            self.logger.info("crt.sh: +%d subdomains", total)
-        return total
-
-
-class GitHubDiscovery:
-    QUERIES = [
-        "language:python stars:>5000",
-        "topic:crawler"
-    ]
-
-    def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.cfg = cfg
-        self.logger = logger
-        self.last_run = 0.0
-
-    async def run(self) -> int:
-        if time.time() - self.last_run < self.cfg.github_interval:
-            return 0
-        self.last_run = time.time()
-        total = 0
-        for q in self.QUERIES:
-            api = f"https://api.github.com/search/repositories?q={quote(q)}&per_page=30"
-            res = await self.fetcher.fetch(api)
-            if res and res['text']:
-                try:
-                    data = json.loads(res['text'])
-                    for repo in data.get('items', []):
-                        repo_url = repo.get('html_url', '')
-                        if repo_url:
-                            norm = URLNormalizer.normalize(repo_url)
-                            if norm:
-                                await self.db.insert_batch([{
-                                    'url': norm,
-                                    'domain': 'github.com',
-                                    'path': URLNormalizer.get_path(norm),
-                                    'depth': 0,
-                                    'parent_url': 'github_discovery',
-                                    'source': 'github',
-                                    'priority': 2.0
-                                }])
-                                total += 1
-                except json.JSONDecodeError:
-                    pass
-        if total:
-            self.logger.info("GitHub: +%d repos", total)
-        return total
-
-
-class SitemapDiscovery:
-    PATHS = ['/sitemap.xml', '/sitemap_index.xml']
-
-    def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.cfg = cfg
-        self.logger = logger
-        self.last_run = 0.0
-        self.known: Set[str] = set()
-
-    async def run(self) -> int:
-        if time.time() - self.last_run < self.cfg.sitemap_interval:
-            return 0
-        self.last_run = time.time()
-        total = 0
-        top = [d[0] for d in self.db.top_domains(20)]
-        for dom in top:
-            if dom in self.known:
-                continue
-            self.known.add(dom)
-
-            sitemap_urls: Set[str] = set()
-            robots_url = f"https://{dom}/robots.txt"
-            res_robots = await self.fetcher.fetch(robots_url)
-            if res_robots and res_robots['text']:
-                for line in res_robots['text'].splitlines():
-                    if line.lower().startswith('sitemap:'):
-                        sitemap = line.split(':', 1)[1].strip()
-                        if sitemap:
-                            sitemap_urls.add(sitemap)
-
-            for path in self.PATHS:
-                sitemap_urls.add(f"https://{dom}{path}")
-
-            for sitemap_url in sitemap_urls:
-                res = await self.fetcher.fetch(sitemap_url)
-                if res and res['text'] and '<' in res['text']:
-                    urls = Parser.sitemap(res['text'])
-                    batch = [{'url': u, 'domain': URLNormalizer.get_domain(u),
-                              'path': URLNormalizer.get_path(u), 'depth': 0,
-                              'parent_url': sitemap_url, 'source': 'sitemap', 'priority': 7.0}
-                             for u in urls if URLNormalizer.normalize(u)]
-                    total += await self.db.insert_batch(batch)
-        if total:
-            self.logger.info("Sitemap: +%d URLs", total)
-        return total
-
-
-class RSSDiscovery:
-    PATHS = ['/feed', '/rss']
-
-    def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.cfg = cfg
-        self.logger = logger
-        self.last_run = 0.0
-        self.known: Set[str] = set()
-
-    async def run(self) -> int:
-        if time.time() - self.last_run < self.cfg.rss_interval:
-            return 0
-        self.last_run = time.time()
-        total = 0
-        top = [d[0] for d in self.db.top_domains(20)]
-        for dom in top:
-            if dom in self.known:
-                continue
-            self.known.add(dom)
-            for path in self.PATHS:
-                url = f"https://{dom}{path}"
-                res = await self.fetcher.fetch(url)
-                if res and res['text'] and ('<rss' in res['text'] or '<feed' in res['text']):
-                    urls = Parser.rss(res['text'])
-                    batch = [{'url': u, 'domain': URLNormalizer.get_domain(u),
-                              'path': URLNormalizer.get_path(u), 'depth': 0,
-                              'parent_url': url, 'source': 'rss', 'priority': 5.0}
-                             for u in urls if URLNormalizer.normalize(u)]
-                    total += await self.db.insert_batch(batch)
-        if total:
-            self.logger.info("RSS: +%d URLs", total)
-        return total
-
-
-class WikipediaDumpImporter:
-    LANGS = ['en', 'fr']
-
-    def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.cfg = cfg
-        self.logger = logger
-        self.last_run = 0.0
-
-    async def run(self) -> int:
-        if time.time() - self.last_run < self.cfg.wikipedia_interval:
-            return 0
-        self.last_run = time.time()
-        total = 0
-        for lang in self.LANGS:
-            dump = f"https://dumps.wikimedia.org/{lang}wiki/latest/{lang}wiki-latest-all-titles-in-ns0.gz"
-            res = await self.fetcher.fetch(dump)
-            if res and res['text']:
-                urls: Set[str] = set()
-                for line in res['text'].split('\n')[:5000]:
-                    title = line.strip()
-                    if title:
-                        encoded = quote(title.replace(' ', '_'))
-                        u = f"https://{lang}.wikipedia.org/wiki/{encoded}"
-                        norm = URLNormalizer.normalize(u)
-                        if norm:
-                            urls.add(norm)
-                batch = [{'url': u, 'domain': f'{lang}.wikipedia.org',
-                          'path': URLNormalizer.get_path(u), 'depth': 0,
-                          'parent_url': dump, 'source': 'wikipedia', 'priority': 5.0}
-                         for u in urls]
-                total += await self.db.insert_batch(batch)
-        if total:
-            self.logger.info("Wikipedia: +%d URLs", total)
-        return total
-
-
-class DatasetImporter:
-    DATASETS = [
-        "https://raw.githubusercontent.com/cisagov/dotgov-data/main/current-federal.csv",
-    ]
-
-    def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.cfg = cfg
-        self.logger = logger
-        self.last_run = 0.0
-
-    async def run(self) -> int:
-        if time.time() - self.last_run < self.cfg.dataset_interval:
-            return 0
-        self.last_run = time.time()
-        total = 0
-        for ds in self.DATASETS:
-            res = await self.fetcher.fetch(ds)
-            if res and res['text']:
-                urls = Parser.extract_all(res['text'])
-                batch = [{'url': u, 'domain': URLNormalizer.get_domain(u),
-                          'path': URLNormalizer.get_path(u), 'depth': 0,
-                          'parent_url': ds, 'source': 'dataset', 'priority': 7.0}
-                         for u in urls if URLNormalizer.normalize(u)]
-                total += await self.db.insert_batch(batch)
-        if total:
-            self.logger.info("Datasets: +%d URLs", total)
-        return total
-
+    def close(self):
+        if self.conn:
+            self.conn.commit()
+            self.conn.close()
 
 # ---------------------------------------------------------------------------
-# 9. QUEUE MANAGER
+# GLOBAL LINK EXTRACTOR (Extracts absolutely all link types & direct files)
 # ---------------------------------------------------------------------------
-class QueueManager:
-    def __init__(self, maxsize: int) -> None:
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+import re
+LINK_PATTERN = re.compile(
+    r'(?:https?|ftp|ftps|ssh|git|svn|ws|wss|magnet|ipfs|ipns|onion|file)://[^\s<>"\'{}|\\^`]+', 
+    re.IGNORECASE
+)
 
-    async def put(self, item: Dict[str, Any]) -> None:
-        try:
-            self.queue.put_nowait(item)
-        except asyncio.QueueFull:
-            pass
+def extract_all_links(text: str, base_url: str) -> set:
+    links = set()
+    if not text:
+        return links
+    
+    for m in LINK_PATTERN.finditer(text):
+        links.add(m.group(0).rstrip('.,;:)>]'))
 
-    async def get(self) -> Dict[str, Any]:
-        return await self.queue.get()
+    try:
+        soup = BeautifulSoup(text, 'lxml')
+        for tag in soup.find_all(['a', 'link', 'script', 'img', 'iframe', 'source', 'embed', 'audio', 'video']):
+            for attr in ('href', 'src', 'data-src', 'action'):
+                val = tag.get(attr)
+                if val:
+                    val = val.strip()
+                    if val.startswith('/') or not urlparse(val).scheme:
+                        try:
+                            val = urljoin(base_url, val)
+                        except Exception:
+                            continue
+                    links.add(val)
+    except Exception:
+        pass
 
-    def qsize(self) -> int:
-        return self.queue.qsize()
-
-    async def join(self) -> None:
-        await self.queue.join()
-
-
-# ---------------------------------------------------------------------------
-# 10. WORKER
-# ---------------------------------------------------------------------------
-class Worker:
-    def __init__(self, wid: int, db: Database, fetcher: Fetcher,
-                 queue_mgr: QueueManager, cfg: Config, logger: logging.Logger):
-        self.wid = wid
-        self.db = db
-        self.fetcher = fetcher
-        self.queue_mgr = queue_mgr
-        self.cfg = cfg
-        self.logger = logger
-        self.processed = 0
-        self.found = 0
-        self.running = False
-
-    async def run(self) -> None:
-        self.running = True
-        while self.running:
-            try:
-                task = await asyncio.wait_for(self.queue_mgr.get(), timeout=5)
-            except asyncio.TimeoutError:
-                continue
-            try:
-                await self._process(task)
-            except Exception as exc:
-                self.logger.debug("Worker %d error: %s", self.wid, exc)
-            finally:
-                self.queue_mgr.queue.task_done()
-
-    async def _process(self, task: Dict[str, Any]) -> None:
-        url = task['url']
-        depth = task.get('depth', 0)
-        if depth > self.cfg.max_depth:
-            return
-
-        res = await self.fetcher.fetch(url)
-        if res:
-            self.processed += 1
-            ct = res['content_type']
-            text = res['text']
-
-            if 'html' in ct:
-                found = Parser.html(text, url)
-            elif 'json' in ct:
-                found = Parser.json_parse(text, url)
-            elif 'xml' in ct or 'rss' in ct or 'atom' in ct:
-                found = Parser.xml(text, url)
-            else:
-                found = Parser.extract_all(text, url)
-
-            new_urls: List[Dict[str, Any]] = []
-            for u in found:
-                norm = URLNormalizer.normalize(u)
-                if norm and not await self.db.bloom.contains_async(norm):
-                    new_urls.append({
-                        'url': norm,
-                        'domain': URLNormalizer.get_domain(norm),
-                        'path': URLNormalizer.get_path(norm),
-                        'depth': depth + 1,
-                        'parent_url': url,
-                        'source': 'crawled',
-                        'priority': task.get('priority', 1.0) * 0.85
-                    })
-            if new_urls:
-                added = await self.db.insert_batch(new_urls)
-                self.found += added
-                for nd in new_urls[:100]:
-                    await self.queue_mgr.put({
-                        'url': nd['url'],
-                        'depth': nd['depth'],
-                        'priority': nd['priority']
-                    })
-            await self.db.mark_visited(url, success=True, content_type=ct,
-                                       content_hash=res.get('hash', ''))
-        else:
-            await self.db.mark_visited(url, success=False)
-
-    def stop(self) -> None:
-        self.running = False
-
+    cleaned = set()
+    for l in links:
+        if l and len(l) < 4000:
+            url, _ = urldefrag(l)
+            cleaned.add(url)
+    return cleaned
 
 # ---------------------------------------------------------------------------
-# 11. STATISTICS
-# ---------------------------------------------------------------------------
-class Stats:
-    def __init__(self, db: Database, fetcher: Fetcher, queue_mgr: QueueManager,
-                 cfg: Config, logger: logging.Logger):
-        self.db = db
-        self.fetcher = fetcher
-        self.queue_mgr = queue_mgr
-        self.cfg = cfg
-        self.logger = logger
-        self.start_time = time.time()
-
-    async def report_loop(self) -> None:
-        while True:
-            await asyncio.sleep(self.cfg.stats_interval)
-            elapsed = time.time() - self.start_time
-            total = self.db.total_urls()
-            est_unique = self.db.bloom.estimate_count()
-            db_mb = os.path.getsize(self.cfg.db_path) / (1024 * 1024) if os.path.exists(self.cfg.db_path) else 0
-            self.logger.info(
-                "⏱ %.0f min | Total: %d (~%d unique) | DB: %.1f MB | Queue: %d | "
-                "Req: %d | Err: %d | Timeout: %d",
-                elapsed / 60, total, est_unique, db_mb,
-                self.queue_mgr.qsize(),
-                self.fetcher.requests, self.fetcher.errors, self.fetcher.timeouts)
-            for domain, cnt in self.db.top_domains(10):
-                self.logger.info("  🏆 %s: %d", domain, cnt)
-
-
-# ---------------------------------------------------------------------------
-# 12. CRAWLER (orchestrator)
+# CRAWLER ENGINE
 # ---------------------------------------------------------------------------
 class Crawler:
     def __init__(self):
         self.cfg = Config()
-        self.logger = setup_logger(self.cfg)
-        self.db = Database(self.cfg, self.logger)
-        self.fetcher = Fetcher(self.cfg, self.logger)
-        self.queue_mgr = QueueManager(self.cfg.max_queue_size)
-        self.stats = Stats(self.db, self.fetcher, self.queue_mgr, self.cfg, self.logger)
-        self.workers: List[Worker] = []
-        self.discoverers = [
-            CommonCrawlImporter(self.db, self.fetcher, self.cfg, self.logger),
-            CDXImporter(self.db, self.fetcher, self.cfg, self.logger),
-            CrtShDiscovery(self.db, self.fetcher, self.cfg, self.logger),
-            GitHubDiscovery(self.db, self.fetcher, self.cfg, self.logger),
-            SitemapDiscovery(self.db, self.fetcher, self.cfg, self.logger),
-            RSSDiscovery(self.db, self.fetcher, self.cfg, self.logger),
-            WikipediaDumpImporter(self.db, self.fetcher, self.cfg, self.logger),
-            DatasetImporter(self.db, self.fetcher, self.cfg, self.logger),
-        ]
+        self.db = Database(self.cfg)
+        self.queue = asyncio.Queue(maxsize=self.cfg.max_queue_size)
+        self.session = None
+        self.active = True
 
-    async def _seed(self) -> None:
-        self.logger.info("Seeding initial target URLs...")
+    def get_yerevan_time(self) -> datetime:
+        """Վերադարձնում է ընթացիկ ժամը Երևանի ժամային գոտով (UTC+4)"""
+        utc_now = datetime.now(timezone.utc)
+        return utc_now.astimezone(timezone(timedelta(hours=4)))
+
+    async def _periodic_flush_loop(self):
+        while True:
+            await asyncio.sleep(self.cfg.flush_interval)
+            if self.active:
+                await self.db.flush()
+                logger.info("💾 Auto-flush. Total links in active DB: %d", self.db.total_count())
+
+    async def _seed(self):
+        logger.info("🌱 Seeding mega hubs with billions of internal/external links...")
         seeds = [
-            "https://en.wikipedia.org/wiki/Special:Random",
-            "https://github.com/trending", 
-            "https://news.ycombinator.com/",
-            "https://stackoverflow.com/questions?tab=votes",
-            "https://www.bbc.com", 
-            "https://www.nytimes.com",
-            "https://www.google.com", 
-            "https://www.bing.com",
-            "https://archive.org/",
+            "https://curlie.org/en",                          # Ամենամեծ կատալոգը
+            "https://dmoz-odp.org/",                           # Հսկայական ինդեքսացված արխիվ
+            "https://www.directoryofdirectories.com/",         # Միլիոնավոր ֆայլերի հղումներ
+            "https://archive.org/details/software",            # Ուղիղ ֆայլեր և մեդիա
+            "https://thepiratebay.org/",                       # Տորենտներ և Magnet հղումներ
+            "https://libgen.is/",                              # Գրքեր, PDF-ներ, արխիվներ
+            "https://news.ycombinator.com/lists",              # Արժեքավոր տեխնոլոգիական հղումներ
+            "https://reddit.com/r/all",                        # Աշխարհի ամենաակտիվ էջը
+            "https://github.com/collections",                  # Կոդեր և ռեպոզիտորիաներ
+            "https://en.wikipedia.org/wiki/Portal:Contents",   # Վիքիպեդիայի մայր էջը
+            "https://www.w3.org/Consortium/Member/List"        # Պաշտոնական գլոբալ ցուցակ
         ]
-        batch = []
-        for s in seeds:
-            norm = URLNormalizer.normalize(s)
-            if norm and not await self.db.bloom.contains_async(norm):
-                batch.append({
-                    'url': norm,
-                    'domain': URLNormalizer.get_domain(norm),
-                    'path': URLNormalizer.get_path(norm),
-                    'depth': 0,
-                    'parent_url': '',
-                    'source': 'seed',
-                    'priority': 10.0
-                })
-        if batch:
-            await self.db.insert_batch(batch)
-            await self.db._flush() # Ստիպողաբար անմիջապես գրում ենք բազա!
+        await self.db.insert_many(seeds, source='seed')
+        await self.db.flush()
 
-        pending = await self.db.get_pending(2000)
-        self.logger.info("Loaded %d URLs into active queue from seed.", len(pending))
-        for p in pending:
-            await self.queue_mgr.put({'url': p['url'], 'depth': p['depth'], 'priority': p['priority']})
+        pending = await self.db.get_pending(3000)
+        logger.info("Loaded %d URLs to active queue.", len(pending))
+        for url in pending:
+            await self.queue.put(url)
 
-    async def run(self) -> None:
-        self.logger.info("🪐 AWEC Planetary Crawler starting")
-        await self.fetcher.start()
+    async def _worker(self):
+        while True:
+            if not self.active:
+                await asyncio.sleep(1)
+                continue
 
-        # Ակտիվացնում ենք ֆոնային ցիկլերը
-        asyncio.create_task(self.db.periodic_flush())
-        asyncio.create_task(self.stats.report_loop())
-        asyncio.create_task(self._discovery_loop())
-        asyncio.create_task(self._feeder_loop())
+            try:
+                url = await asyncio.wait_for(self.queue.get(), timeout=5)
+            except asyncio.TimeoutError:
+                continue
 
-        # Seed-ավորումը կատարում ենք ԱՌԱՋԻՆԸ
-        await self._seed()
+            try:
+                async with self.session.get(url, allow_redirects=True, ssl=False) as resp:
+                    if resp.status == 200:
+                        text = await resp.text(errors='ignore')
+                        found_links = extract_all_links(text, url)
+                        
+                        if found_links and self.active:
+                            await self.db.insert_many(found_links)
+                            for fl in list(found_links)[:80]:
+                                try:
+                                    self.queue.put_nowait(fl)
+                                except asyncio.QueueFull:
+                                    break
+            except Exception:
+                pass
+            finally:
+                self.queue.task_done()
 
-        # Միացնում ենք աշխատողներին
-        self.workers = [
-            Worker(i, self.db, self.fetcher, self.queue_mgr, self.cfg, self.logger)
-            for i in range(self.cfg.max_workers)
-        ]
-        for w in self.workers:
-            asyncio.create_task(w.run())
+    async def upload_to_internet_archive(self, file_path: str):
+        """Վերբեռնում է .db ֆայլը Internet Archive-ի քո նշված էջի մեջ (Retry-ով)"""
+        if not self.cfg.ia_access_key or not self.cfg.ia_secret_key:
+            logger.warning("⚠️ Internet Archive keys are missing! Upload skipped.")
+            return False
 
-        deadline = self.cfg.deadline
-        self.logger.info("Working until %s", datetime.fromtimestamp(deadline).strftime('%H:%M:%S'))
-        while time.time() < deadline:
-            await asyncio.sleep(15)
+        filename = os.path.basename(file_path)
+        upload_url = f"https://s3.us.archive.org/{self.cfg.ia_identifier}/{filename}"
+        
+        headers = {
+            "Authorization": f"LOW {self.cfg.ia_access_key}:{self.cfg.ia_secret_key}",
+            "X-Archive-Create-Bucket": "0",  # Էջը արդեն գոյություն ունի
+            "X-Archive-Keep-Old-Version": "1"
+        }
 
-        self.logger.info("Shutting down...")
-        for w in self.workers:
-            w.stop()
-        try:
-            await asyncio.wait_for(self.queue_mgr.join(), timeout=30)
-        except asyncio.TimeoutError:
-            pass
-        await self.db._flush()
-        await self.fetcher.stop()
+        # 3 անգամ Retry ձախողման դեպքում
+        for attempt in range(1, 4):
+            logger.info("📡 Upload attempt %d/3 for %s...", attempt, filename)
+            try:
+                async with aiohttp.ClientSession() as upload_session:
+                    with open(file_path, "rb") as f_data:
+                        async with upload_session.put(upload_url, data=f_data, headers=headers) as resp:
+                            if resp.status == 200:
+                                logger.info("🎉 SUCCESS! %s uploaded to IA.", filename)
+                                return True
+                            else:
+                                resp_text = await resp.text()
+                                logger.error("❌ Attempt %d failed. Status: %d, Msg: %s", attempt, resp.status, resp_text)
+            except Exception as e:
+                logger.error("❌ Exception during upload attempt %d: %s", attempt, e)
+            await asyncio.sleep(10)
+        return False
 
-        if self.cfg.ia_access and self.cfg.ia_secret:
-            await self._archive()
+    async def run_archive_routine(self):
+        """23:55-ի արխիվացման գործողությունները"""
+        logger.info("🕒 It is 23:55 (Yerevan Time). Pausing Crawler for Archive Routine...")
+        self.active = False
+        await asyncio.sleep(2) # Սպասում ենք, որ վերջին հարցումները փակվեն
+        await self.db.flush()
 
+        # 1. Հաշվում ենք ընդհանուր քանակը
+        total_links = self.db.total_count()
+        logger.info("Total links collected today: %d", total_links)
+
+        # 2. Ձևավորում ենք ֆայլի անունը (MM_DD_YYYY_links_count.db)
+        yerevan_now = self.get_yerevan_time()
+        date_str = yerevan_now.strftime("%m_%d_%Y")
+        archive_filename = f"{date_str}_links_{total_links}.db"
+
+        # 3. Փակում ենք բազայի կապը, որպեսզի ֆայլը ապահով պատճենվի
         self.db.close()
-        self.logger.info("Job finished. Total URLs: %d", self.db.total_urls())
+        shutil.copy(Config.db_path, archive_filename)
+        logger.info("Created daily archive copy: %s", archive_filename)
 
-    async def _discovery_loop(self) -> None:
+        # 4. Վերբեռնում ենք Internet Archive
+        upload_success = await self.upload_to_internet_archive(archive_filename)
+        
+        # 5. Ջնջում ենք տեղային պատճենը վերբեռնելուց հետո
+        if os.path.exists(archive_filename):
+            os.remove(archive_filename)
+
+        # 6. Ժամը 00:00-ի նոր սեսիայի պատրաստում
+        logger.info("Waiting for midnight (00:00) to start new session...")
         while True:
-            for disc in self.discoverers:
-                try:
-                    await disc.run()
-                except Exception as exc:
-                    self.logger.error("Discovery %s error: %s", disc.__class__.__name__, exc)
-            await asyncio.sleep(60)
+            now = self.get_yerevan_time()
+            if now.hour == 0 and now.minute >= 0:
+                break
+            await asyncio.sleep(5)
 
-    async def _feeder_loop(self) -> None:
+        # 7. Ջնջում ենք հին links.db-ն և ստեղծում նորը
+        if os.path.exists(Config.db_path):
+            os.remove(Config.db_path)
+            # Եթե WAL ռեժիմի կողմնակի ֆայլերը կան, դրանք էլ ենք ջնջում
+            for ext in ['-wal', '-journal', '-shm']:
+                if os.path.exists(Config.db_path + ext):
+                    os.remove(Config.db_path + ext)
+
+        logger.info("🆕 Starting new session for a brand new day!")
+        self.db.connect()
+        
+        # 8. Մաքրում ենք հին հերթը ու նորից սնուցում Seed-երով
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+            except Exception:
+                break
+
+        await self._seed()
+        self.active = True
+        logger.info("🚀 Crawler resumed successfully.")
+
+    async def _time_monitor_loop(self):
+        """Անդադար հսկում է Երևանի ժամանակը 23:55-ին հասնելու համար"""
         while True:
-            if self.queue_mgr.qsize() < 20000:
-                pending = await self.db.get_pending(1000)
-                for p in pending:
-                    await self.queue_mgr.put({'url': p['url'], 'depth': p['depth'], 'priority': p['priority']})
-            await asyncio.sleep(1)
+            now = self.get_yerevan_time()
+            if now.hour == 23 and now.minute == 55:
+                await self.run_archive_routine()
+            await asyncio.sleep(15) # Ստուգում ենք 15 վայրկյանը մեկ
 
-    async def _archive(self) -> None:
+    async def run(self):
+        logger.info("🪐 AWEC Continuous Planetary Crawler Initiated...")
+        
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True)
+        timeout = aiohttp.ClientTimeout(total=self.cfg.request_timeout)
+        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+
+        # Գործարկում ենք ֆոնային պարբերական աշխատանքները
+        asyncio.create_task(self._periodic_flush_loop())
+        asyncio.create_task(self._time_monitor_loop())
+
+        # Եթե բազան դատարկ է, լցնում ենք Seed-երով
+        if self.db.total_count() == 0:
+            await self._seed()
+        else:
+            pending = await self.db.get_pending(3000)
+            for url in pending:
+                await self.queue.put(url)
+
+        # Աշխատողներ
+        workers = [asyncio.create_task(self._worker()) for _ in range(self.cfg.max_workers)]
+
+        # Անվերջ պահում ենք սկրիպտը ակտիվ (քանի որ VPS-ի վրա է աշխատելու)
         try:
-            import internetarchive as ia
-            now = datetime.now(timezone.utc)
-            if now.hour != 23 or now.minute < 55:
-                return
-            urls = [r[0] for r in self.db.conn.execute(
-                "SELECT url FROM urls WHERE status='visited'").fetchall()]
-            if not urls:
-                return
-            content = '\n'.join(urls)
-            gz = gzip.compress(content.encode())
-            item_id = f"awec-{now.strftime('%Y-%m-%d')}-{random.randint(1000,9999)}"
-            ia.configure(
-                access_key=self.cfg.ia_access,
-                secret_key=self.cfg.ia_secret
-            ).upload(
-                item_id,
-                file_objects=[BytesIO(gz)],
-                file_names=[f"links_{now.strftime('%Y-%m-%d')}.txt.gz"],
-                metadata={
-                    "collection": "awec_links_awe_o.s",
-                    "title": f"AWEC Dump {now.strftime('%Y-%m-%d')}",
-                    "creator": "AWEC-v8",
-                    "date": now.strftime('%Y-%m-%d'),
-                    "mediatype": "texts"
-                }
-            )
-            self.logger.info("Archived %d URLs to %s", len(urls), item_id)
-        except Exception as exc:
-            self.logger.error("Archive error: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# 13. MAIN
-# ---------------------------------------------------------------------------
-async def main() -> None:
-    crawler = Crawler()
-    await crawler.run()
+            while True:
+                await asyncio.sleep(3600)
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Shutting down...")
+            for w in workers:
+                w.cancel()
+            await self.db.flush()
+            await self.session.close()
+            self.db.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(Crawler().run())
