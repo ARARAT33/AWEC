@@ -1,9 +1,12 @@
 name: AWEC Continuous Link Collector
 
 on:
+  push:
+    branches:
+      - main              # Հենց կոդը push անես main branch, ավտոմատ կսկսի աշխատել
   schedule:
     - cron: '0 */6 * * *' # Ամեն 6 ժամը մեկ
-  workflow_dispatch:      # Ձեռքով միացում
+  workflow_dispatch:      # Ձեռքով միացնելու հնարավորություն
 
 jobs:
   crawl:
@@ -30,35 +33,46 @@ jobs:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
         run: |
-          # Աշխատեցնում ենք 5 ժամ (18000 վայրկյան)
+          # Սարդը աշխատում է 5 ժամ (18000 վայրկյան), հետո ինքնուրույն անջատվում է
           timeout 18000 python collector_247.py || true
 
       - name: Export DB to Plain Text
-        # Սա կապահովագրի, որ եթե նույնիսկ .db-ն խնդիր տա, տեքստային տարբերակը 100% կլինի
+        # 'always()' երաշխավորում է, որ քայլը կաշխատի նույնիսկ ձեռքով Cancel անելու դեպքում
+        if: always()
         run: |
           python -c "
           import sqlite3
-          try:
-              conn = sqlite3.connect('links.db')
-              cursor = conn.cursor()
-              cursor.execute('SELECT url FROM urls')
-              urls = cursor.fetchall()
-              with open('links.txt', 'w', encoding='utf-8') as f:
-                  for u in urls:
-                      f.write(u[0] + '\n')
-              print(f'Successfully exported {len(urls)} links.')
-              conn.close()
-          except Exception as e:
-              print('Export failed:', e)
+          import os
+          if os.path.exists('links.db'):
+              try:
+                  conn = sqlite3.connect('links.db')
+                  cursor = conn.cursor()
+                  cursor.execute('SELECT url FROM urls')
+                  urls = cursor.fetchall()
+                  with open('links.txt', 'w', encoding='utf-8') as f:
+                      for u in urls:
+                          f.write(u[0] + '\n')
+                  print(f'🎉 Successfully exported {len(urls)} links to links.txt')
+                  conn.close()
+              except Exception as e:
+                  print('Export failed:', e)
+          else:
+              print('links.db not found, creating empty links.txt')
+              with open('links.txt', 'w') as f:
+                  f.write('')
           "
 
       - name: Upload Links Text as Artifact
+        # Սա նույնպես կաշխատի միշտ (նույնիսկ Cancel-ից հետո) ու կտա քեզ ZIP ֆայլը
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: harvested-links-text
           path: links.txt
 
       - name: Commit and Push DB Updates
+        # Բազայի վերջնական պահպանումը GitHub-ում (միայն եթե աշխատանքը բնական է ավարտվել)
+        if: success()
         run: |
           git config --global user.name "AWEC Planetary Bot"
           git config --global user.email "bot@awec.internal"
@@ -67,6 +81,8 @@ jobs:
           git push origin main
 
       - name: Trigger Next Run (24/7 Loop)
+        # Հաջորդ ցիկլի ավտոմատ միացումը (միայն եթե նախորդը հաջողությամբ ավարտվել է)
+        if: success()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
