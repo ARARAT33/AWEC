@@ -5,7 +5,6 @@ on:
   repository_dispatch:
     types: [trigger_crawler] # Ինքնագործարկման ազդակը
 
-# Տալիս ենք բոլոր անհրաժեշտ իրավունքները ներկառուցված GITHUB_TOKEN-ին
 permissions: write-all
 
 jobs:
@@ -22,7 +21,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          # Հեռացրել ենք cache-ը, որպեսզի requirements.txt չփնտրի ու սխալ չտա
 
       - name: Install Dependencies
         run: |
@@ -31,7 +30,16 @@ jobs:
 
       - name: Run Crawler (Max 5 Hours)
         run: |
-          python collector_247.py
+          # Օպտիմալացնում ենք զուգահեռ աշխատողներին Actions-ի թույլ սերվերի համար
+          # Գործարկում ենք քո տրամադրած ֆայլը
+          python -c "
+          with open('collector_247_2.py', 'r') as f:
+              code = f.read()
+          code = code.replace('max_workers: int = 2000', 'max_workers: int = 150')
+          with open('collector_247_2.py', 'w') as f:
+              f.write(code)
+          "
+          python collector_247_2.py
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
@@ -55,7 +63,6 @@ jobs:
           echo "Սպասում ենք 30 վայրկյան՝ RAM-ը թարմացնելու և հաջորդ ցիկլը սկսելու համար..."
           sleep 30
           
-          # Օգտագործում ենք հենց ներկառուցված GITHUB_TOKEN-ը
           curl -L \
             -X POST \
             -H "Accept: application/vnd.github+json" \
