@@ -33,7 +33,7 @@ jobs:
           # Օպտիմալացնում ենք զուգահեռ աշխատողներին Actions-ի թույլ սերվերի համար
           # Գործարկում ենք քո տրամադրած ֆայլը
           python -c "
-          with open('collector_247_2.py', 'r') as f:
+          with open('collector_247.py', 'r') as f:
               code = f.read()
           code = code.replace('max_workers: int = 2000', 'max_workers: int = 150')
           with open('collector_247_2.py', 'w') as f:
