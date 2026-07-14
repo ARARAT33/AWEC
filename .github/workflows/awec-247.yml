@@ -172,10 +172,17 @@ jobs:
           FILENAME="${{ steps.prep.outputs.ARCHIVE_FILENAME }}"
           echo "📤 Sending snapshot to Archive.org: $FILENAME"
           
-          # Ավտոմատ կոնֆիգուրացնում ենք ia քլիենթը մեր գաղտնի բանալիներով
-          printf "%s\n%s\n" "$IA_ACCESS_KEY" "$IA_SECRET_KEY" | ia configure
+          # 1. Ստեղծում ենք կոնֆիգուրացիայի թղթապանակը վիրտուալ մեքենայի ներսում
+          mkdir -p ~/.config
           
-          # Վերբեռնում ենք ֆայլը
+          # 2. Գրում ենք քո Repository Secrets-ի արժեքները կոնֆիգ ֆայլի մեջ
+          cat <<EOF > ~/.config/ia.ini
+          [s3]
+          access = $IA_ACCESS_KEY
+          secret = $IA_SECRET_KEY
+          EOF
+          
+          # 3. Վերբեռնում ենք ֆայլը
           ia upload awec_links_awe_o.s "$FILENAME" \
             --metadata="title:AWEC Harvest $FILENAME" \
             --metadata="mediatype:data" \
