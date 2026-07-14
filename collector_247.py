@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
 AWEC Production Crawler – Self‑expanding URL collector, 24/7 ready.
-Includes: URL normalization, Bloom filter, batch save, sitemap discovery,
-          robots.txt sitemap extraction, RSS/Atom, JS/CSS URL extraction,
-          file URL extraction (all text formats).
+Optimized for GitHub Actions (Thread-safe SQLite & Asynchronous Deadlock Prevention).
 """
 import asyncio
 import aiohttp
@@ -37,14 +35,14 @@ from lxml import etree
 class Config:
     db_path: str = "links.db"
     log_file: str = "logs/crawler.log"
-    max_workers: int = 2000
+    max_workers: int = 100              # Օպտիմալացված GitHub Actions-ի համար
     max_queue_size: int = 150_000
     max_depth: int = 100
     request_timeout: int = 8
     max_retries: int = 3
     backoff_base: float = 1.5
-    batch_size: int = 2000
-    flush_interval: float = 120.0
+    batch_size: int = 1000              # Ավելի փոքր խմբեր՝ արագ թարմացման համար
+    flush_interval: float = 30.0        # Ավելի արագ flush
     bloom_size: int = 500_000_000
     bloom_hashes: int = 7
     commoncrawl_interval: int = 3600
@@ -57,10 +55,10 @@ class Config:
     wikipedia_interval: int = 7200
     ia_access: str = os.getenv("IA_ACCESS_KEY", "")
     ia_secret: str = os.getenv("IA_SECRET_KEY", "")
-    job_hours: float = 5.0              # 5h0m
+    job_hours: float = 5.0              # 5 ժամ աշխատանքային ցիկլ
     dns_cache_ttl: int = 300
     log_level: str = "INFO"
-    stats_interval: int = 120
+    stats_interval: int = 60            # Ստատիստիկան՝ ամեն րոպե
 
     @property
     def deadline(self) -> float:
@@ -193,7 +191,7 @@ class URLNormalizer:
 
 
 # ---------------------------------------------------------------------------
-# 5. DATABASE
+# 5. DATABASE (Thread-Safe Wrapper with to_thread)
 # ---------------------------------------------------------------------------
 class Database:
     def __init__(self, cfg: Config, logger: logging.Logger) -> None:
@@ -206,6 +204,7 @@ class Database:
         self._load_bloom()
         self._buffer: List[Dict[str, Any]] = []
         self._buf_lock = asyncio.Lock()
+        self._db_lock = asyncio.Lock() # Thread synchronization lock
         self._last_flush = time.time()
 
     def _optimize(self) -> None:
@@ -213,7 +212,7 @@ class Database:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA cache_size=-200000")
         self.conn.execute("PRAGMA temp_store=MEMORY")
-        self.conn.execute("PRAGMA busy_timeout=5000")
+        self.conn.execute("PRAGMA busy_timeout=15000")
 
     def _create_tables(self) -> None:
         self.conn.executescript("""
@@ -260,14 +259,20 @@ class Database:
         return 0
 
     async def _flush(self) -> int:
-        if not self._buffer:
-            return 0
+        async with self._db_lock:
+            if not self._buffer:
+                return 0
+            # Կատարում ենք բազայի գրառումը սերվերի առանձին Thread-ում, որպեսզի Event Loop-ը չսառչի
+            inserted = await asyncio.to_thread(self._sync_flush, list(self._buffer))
+            self._buffer.clear()
+            self._last_flush = time.time()
+            return inserted
+
+    def _sync_flush(self, buffer_to_write: List[Dict[str, Any]]) -> int:
         now = datetime.now(timezone.utc).isoformat()
         inserted = 0
-        for d in self._buffer:
+        for d in buffer_to_write:
             url = d['url']
-            if self.bloom.contains(url):
-                continue
             try:
                 self.conn.execute(
                     """INSERT OR IGNORE INTO urls
@@ -291,13 +296,11 @@ class Database:
             except Exception as exc:
                 self.logger.debug("Insert error for %s: %s", url[:80], exc)
         self.conn.commit()
-        if self._buffer:
+        if buffer_to_write:
             self.conn.execute(
                 "INSERT OR REPLACE INTO crash_recovery (id, last_url, last_time) VALUES (1,?,?)",
-                (self._buffer[-1]['url'], now))
+                (buffer_to_write[-1]['url'], now))
             self.conn.commit()
-        self._buffer.clear()
-        self._last_flush = time.time()
         return inserted
 
     async def periodic_flush(self) -> None:
@@ -307,7 +310,12 @@ class Database:
                 if self._buffer:
                     await self._flush()
 
-    def get_pending(self, limit: int = 2000) -> List[Dict[str, Any]]:
+    async def get_pending(self, limit: int = 2000) -> List[Dict[str, Any]]:
+        async with self._db_lock:
+            # get_pending-ը նույնպես աշխատեցնում ենք Thread-ում՝ սառեցումներից խուսափելու համար
+            return await asyncio.to_thread(self._sync_get_pending, limit)
+
+    def _sync_get_pending(self, limit: int) -> List[Dict[str, Any]]:
         now = datetime.now(timezone.utc).isoformat()
         rows = self.conn.execute(
             """SELECT url, depth, priority FROM urls
@@ -321,8 +329,12 @@ class Database:
         self.conn.commit()
         return [{'url': r[0], 'depth': r[1], 'priority': r[2]} for r in rows]
 
-    def mark_visited(self, url: str, success: bool = True,
-                     content_type: str = '', content_hash: str = '') -> None:
+    async def mark_visited(self, url: str, success: bool = True,
+                           content_type: str = '', content_hash: str = '') -> None:
+        async with self._db_lock:
+            await asyncio.to_thread(self._sync_mark_visited, url, success, content_type, content_hash)
+
+    def _sync_mark_visited(self, url: str, success: bool, content_type: str, content_hash: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         status = 'visited' if success else 'failed'
         self.conn.execute(
@@ -369,7 +381,7 @@ class Fetcher:
             connector=connector,
             timeout=timeout,
             headers={
-                'User-Agent': 'AWEC/8.0',
+                'User-Agent': 'AWEC/8.0 (Planetary Web Crawler)',
                 'Accept': '*/*',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Accept-Language': 'en-US,en;q=0.9'
@@ -569,7 +581,7 @@ class Parser:
 
 
 # ---------------------------------------------------------------------------
-# 8. DISCOVERY MODULES (including robots.txt sitemap extraction)
+# 8. DISCOVERY MODULES
 # ---------------------------------------------------------------------------
 class CommonCrawlImporter:
     INDEXES = [
@@ -595,7 +607,7 @@ class CommonCrawlImporter:
             res = await self.fetcher.fetch(idx)
             if res and res['text']:
                 urls: Set[str] = set()
-                for line in res['text'].split('\n')[:200000]:
+                for line in res['text'].split('\n')[:10000]: # Փոքրացրել ենք ծավալը Actions-ի համար
                     parts = line.split(' ')
                     if len(parts) >= 3:
                         raw = parts[2] if parts[2].startswith('http') else 'https://' + parts[2]
@@ -613,8 +625,7 @@ class CommonCrawlImporter:
 
 
 class CDXImporter:
-    DOMAINS = ['wikipedia.org', 'github.com', 'stackoverflow.com', 'reddit.com',
-               'youtube.com', 'amazon.com', 'bbc.com', 'nytimes.com', 'medium.com']
+    DOMAINS = ['wikipedia.org', 'github.com', 'stackoverflow.com', 'reddit.com']
 
     def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
         self.db = db
@@ -629,7 +640,7 @@ class CDXImporter:
         self.last_run = time.time()
         total = 0
         for dom in self.DOMAINS:
-            cdx = f"https://web.archive.org/cdx/search/cdx?url={dom}/*&output=text&fl=original&limit=100000"
+            cdx = f"https://web.archive.org/cdx/search/cdx?url={dom}/*&output=text&fl=original&limit=1000"
             res = await self.fetcher.fetch(cdx)
             if res and res['text']:
                 urls: Set[str] = set()
@@ -649,9 +660,7 @@ class CDXImporter:
 
 
 class CrtShDiscovery:
-    DOMAINS = ['google.com', 'facebook.com', 'apple.com', 'microsoft.com',
-               'amazon.com', 'netflix.com', 'twitter.com', 'linkedin.com',
-               'github.com', 'cloudflare.com']
+    DOMAINS = ['google.com', 'github.com', 'cloudflare.com']
 
     def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
         self.db = db
@@ -672,7 +681,7 @@ class CrtShDiscovery:
                 try:
                     data = json.loads(res['text'])
                     subs: Set[str] = set()
-                    for entry in data:
+                    for entry in data[:100]: # Սահմանափակում արագության համար
                         for name in entry.get('name_value', '').split('\n'):
                             name = name.strip()
                             if name and '*' not in name:
@@ -694,9 +703,7 @@ class CrtShDiscovery:
 
 class GitHubDiscovery:
     QUERIES = [
-        "language:python stars:>1000",
-        "language:javascript stars:>1000",
-        "topic:web-scraping",
+        "language:python stars:>5000",
         "topic:crawler"
     ]
 
@@ -713,7 +720,7 @@ class GitHubDiscovery:
         self.last_run = time.time()
         total = 0
         for q in self.QUERIES:
-            api = f"https://api.github.com/search/repositories?q={quote(q)}&per_page=100"
+            api = f"https://api.github.com/search/repositories?q={quote(q)}&per_page=30"
             res = await self.fetcher.fetch(api)
             if res and res['text']:
                 try:
@@ -741,8 +748,7 @@ class GitHubDiscovery:
 
 
 class SitemapDiscovery:
-    """Finds sitemaps via common paths AND robots.txt Sitemap: directives."""
-    PATHS = ['/sitemap.xml', '/sitemap_index.xml', '/sitemap-index.xml']
+    PATHS = ['/sitemap.xml', '/sitemap_index.xml']
 
     def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
         self.db = db
@@ -757,13 +763,12 @@ class SitemapDiscovery:
             return 0
         self.last_run = time.time()
         total = 0
-        top = [d[0] for d in self.db.top_domains(100)]
+        top = [d[0] for d in self.db.top_domains(20)]
         for dom in top:
             if dom in self.known:
                 continue
             self.known.add(dom)
 
-            # 1. Try robots.txt to get Sitemap: lines
             sitemap_urls: Set[str] = set()
             robots_url = f"https://{dom}/robots.txt"
             res_robots = await self.fetcher.fetch(robots_url)
@@ -774,11 +779,9 @@ class SitemapDiscovery:
                         if sitemap:
                             sitemap_urls.add(sitemap)
 
-            # 2. Standard paths
             for path in self.PATHS:
                 sitemap_urls.add(f"https://{dom}{path}")
 
-            # Fetch and parse each candidate
             for sitemap_url in sitemap_urls:
                 res = await self.fetcher.fetch(sitemap_url)
                 if res and res['text'] and '<' in res['text']:
@@ -794,7 +797,7 @@ class SitemapDiscovery:
 
 
 class RSSDiscovery:
-    PATHS = ['/feed', '/rss', '/atom', '/feed.xml', '/rss.xml', '/atom.xml']
+    PATHS = ['/feed', '/rss']
 
     def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
         self.db = db
@@ -809,7 +812,7 @@ class RSSDiscovery:
             return 0
         self.last_run = time.time()
         total = 0
-        top = [d[0] for d in self.db.top_domains(50)]
+        top = [d[0] for d in self.db.top_domains(20)]
         for dom in top:
             if dom in self.known:
                 continue
@@ -830,7 +833,7 @@ class RSSDiscovery:
 
 
 class WikipediaDumpImporter:
-    LANGS = ['en', 'de', 'fr', 'es', 'ru', 'ja', 'zh']
+    LANGS = ['en', 'fr']
 
     def __init__(self, db: Database, fetcher: Fetcher, cfg: Config, logger: logging.Logger):
         self.db = db
@@ -849,7 +852,7 @@ class WikipediaDumpImporter:
             res = await self.fetcher.fetch(dump)
             if res and res['text']:
                 urls: Set[str] = set()
-                for line in res['text'].split('\n')[:500000]:
+                for line in res['text'].split('\n')[:5000]:
                     title = line.strip()
                     if title:
                         encoded = quote(title.replace(' ', '_'))
@@ -869,9 +872,6 @@ class WikipediaDumpImporter:
 
 class DatasetImporter:
     DATASETS = [
-        "https://s3.amazonaws.com/alexa-static/top-1m.csv.zip",
-        "http://s3-us-west-1.amazonaws.com/umbrella-static/top-1m.csv.zip",
-        "https://downloads.majestic.com/majestic_million.csv",
         "https://raw.githubusercontent.com/cisagov/dotgov-data/main/current-federal.csv",
     ]
 
@@ -973,7 +973,7 @@ class Worker:
             elif 'xml' in ct or 'rss' in ct or 'atom' in ct:
                 found = Parser.xml(text, url)
             else:
-                found = Parser.extract_all(text, url)   # covers JS, CSS, TXT, CSV, etc.
+                found = Parser.extract_all(text, url)
 
             new_urls: List[Dict[str, Any]] = []
             for u in found:
@@ -991,16 +991,16 @@ class Worker:
             if new_urls:
                 added = await self.db.insert_batch(new_urls)
                 self.found += added
-                for nd in new_urls[:50]:
+                for nd in new_urls[:100]:
                     await self.queue_mgr.put({
                         'url': nd['url'],
                         'depth': nd['depth'],
                         'priority': nd['priority']
                     })
-            self.db.mark_visited(url, success=True, content_type=ct,
-                                 content_hash=res.get('hash', ''))
+            await self.db.mark_visited(url, success=True, content_type=ct,
+                                       content_hash=res.get('hash', ''))
         else:
-            self.db.mark_visited(url, success=False)
+            await self.db.mark_visited(url, success=False)
 
     def stop(self) -> None:
         self.running = False
@@ -1025,7 +1025,7 @@ class Stats:
             elapsed = time.time() - self.start_time
             total = self.db.total_urls()
             est_unique = self.db.bloom.estimate_count()
-            db_mb = os.path.getsize(self.cfg.db_path) / (1024 * 1024)
+            db_mb = os.path.getsize(self.cfg.db_path) / (1024 * 1024) if os.path.exists(self.cfg.db_path) else 0
             self.logger.info(
                 "⏱ %.0f min | Total: %d (~%d unique) | DB: %.1f MB | Queue: %d | "
                 "Req: %d | Err: %d | Timeout: %d",
@@ -1053,29 +1053,24 @@ class Crawler:
             CDXImporter(self.db, self.fetcher, self.cfg, self.logger),
             CrtShDiscovery(self.db, self.fetcher, self.cfg, self.logger),
             GitHubDiscovery(self.db, self.fetcher, self.cfg, self.logger),
-            SitemapDiscovery(self.db, self.fetcher, self.cfg, self.logger),   # includes robots.txt
+            SitemapDiscovery(self.db, self.fetcher, self.cfg, self.logger),
             RSSDiscovery(self.db, self.fetcher, self.cfg, self.logger),
             WikipediaDumpImporter(self.db, self.fetcher, self.cfg, self.logger),
             DatasetImporter(self.db, self.fetcher, self.cfg, self.logger),
         ]
 
     async def _seed(self) -> None:
+        self.logger.info("Seeding initial target URLs...")
         seeds = [
-            *[f"https://{lang}.wikipedia.org/wiki/Special:Random" for lang in
-              ['en','de','fr','es','ru','ja','zh','ar','pt','it']],
-            "https://github.com/trending", "https://news.ycombinator.com/",
-            "https://www.reddit.com/r/all/hot.json?limit=100",
+            "https://en.wikipedia.org/wiki/Special:Random",
+            "https://github.com/trending", 
+            "https://news.ycombinator.com/",
             "https://stackoverflow.com/questions?tab=votes",
-            "https://medium.com/tag/technology",
-            "https://www.bbc.com", "https://www.nytimes.com",
-            "https://www.amazon.com", "https://www.youtube.com",
-            "https://www.google.com", "https://www.bing.com",
-            "https://www.yahoo.com", "https://www.duckduckgo.com",
-            "https://curlie.org/", "https://archive.org/",
-            "https://api.github.com/repositories",
-            "https://api.publicapis.org/entries",
-            *[f"https://{d}/sitemap.xml" for d in
-              ['www.bbc.com','www.cnn.com','www.nytimes.com','www.wikipedia.org']],
+            "https://www.bbc.com", 
+            "https://www.nytimes.com",
+            "https://www.google.com", 
+            "https://www.bing.com",
+            "https://archive.org/",
         ]
         batch = []
         for s in seeds:
@@ -1092,7 +1087,10 @@ class Crawler:
                 })
         if batch:
             await self.db.insert_batch(batch)
-        pending = self.db.get_pending(10000)
+            await self.db._flush() # Ստիպողաբար անմիջապես գրում ենք բազա!
+
+        pending = await self.db.get_pending(2000)
+        self.logger.info("Loaded %d URLs into active queue from seed.", len(pending))
         for p in pending:
             await self.queue_mgr.put({'url': p['url'], 'depth': p['depth'], 'priority': p['priority']})
 
@@ -1100,13 +1098,16 @@ class Crawler:
         self.logger.info("🪐 AWEC Planetary Crawler starting")
         await self.fetcher.start()
 
+        # Ակտիվացնում ենք ֆոնային ցիկլերը
         asyncio.create_task(self.db.periodic_flush())
         asyncio.create_task(self.stats.report_loop())
         asyncio.create_task(self._discovery_loop())
         asyncio.create_task(self._feeder_loop())
 
+        # Seed-ավորումը կատարում ենք ԱՌԱՋԻՆԸ
         await self._seed()
 
+        # Միացնում ենք աշխատողներին
         self.workers = [
             Worker(i, self.db, self.fetcher, self.queue_mgr, self.cfg, self.logger)
             for i in range(self.cfg.max_workers)
@@ -1117,13 +1118,13 @@ class Crawler:
         deadline = self.cfg.deadline
         self.logger.info("Working until %s", datetime.fromtimestamp(deadline).strftime('%H:%M:%S'))
         while time.time() < deadline:
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
 
         self.logger.info("Shutting down...")
         for w in self.workers:
             w.stop()
         try:
-            await asyncio.wait_for(self.queue_mgr.join(), timeout=60)
+            await asyncio.wait_for(self.queue_mgr.join(), timeout=30)
         except asyncio.TimeoutError:
             pass
         await self.db._flush()
@@ -1146,11 +1147,11 @@ class Crawler:
 
     async def _feeder_loop(self) -> None:
         while True:
-            if self.queue_mgr.qsize() < 50000:
-                pending = self.db.get_pending(2000)
+            if self.queue_mgr.qsize() < 20000:
+                pending = await self.db.get_pending(1000)
                 for p in pending:
                     await self.queue_mgr.put({'url': p['url'], 'depth': p['depth'], 'priority': p['priority']})
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
 
     async def _archive(self) -> None:
         try:
