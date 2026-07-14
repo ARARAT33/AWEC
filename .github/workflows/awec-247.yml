@@ -26,7 +26,7 @@ jobs:
       - name: Install Python Requirements
         run: |
           pip install --upgrade pip
-          pip install aiohttp
+          pip install aiohttp internetarchive
 
       - name: Run AWEC Planetary Crawler
         env:
@@ -37,7 +37,6 @@ jobs:
           timeout 18000 python collector_247.py || true
 
       - name: Export DB to Plain Text
-        # 'always()' երաշխավորում է, որ քայլը կաշխատի նույնիսկ ձեռքով Cancel անելու դեպքում
         if: always()
         run: |
           python -c "
@@ -56,14 +55,28 @@ jobs:
                   conn.close()
               except Exception as e:
                   print('Export failed:', e)
-          else:
-              print('links.db not found, creating empty links.txt')
-              with open('links.txt', 'w') as f:
-                  f.write('')
           "
 
+      - name: Upload to Internet Archive
+        if: success()
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+        run: |
+          # Հաշվում ենք հղումների քանակը
+          COUNT=$(sqlite3 links.db "SELECT COUNT(*) FROM urls")
+          # Սարքում ենք անունը՝ hour_dd_mm_yyyy_links_քանակ.db (Երևանի ժամանակով)
+          FILENAME="$(date -d '+4 hours' +'%H_%d_%m_%Y')_links_${COUNT}.db"
+          cp links.db "$FILENAME"
+          
+          # Վերբեռնում ենք Archive.org (առանց հին ֆայլերը ջնջելու)
+          ia configure --access-key "$IA_ACCESS_KEY" --secret-key "$IA_SECRET_KEY"
+          ia upload awec_links_awe_o.s "$FILENAME" \
+            --metadata="title:AWEC Harvest $FILENAME" \
+            --metadata="mediatype:data" \
+            --metadata="collection:opensource"
+
       - name: Upload Links Text as Artifact
-        # Սա նույնպես կաշխատի միշտ (նույնիսկ Cancel-ից հետո) ու կտա քեզ ZIP ֆայլը
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -71,7 +84,6 @@ jobs:
           path: links.txt
 
       - name: Commit and Push DB Updates
-        # Բազայի վերջնական պահպանումը GitHub-ում (միայն եթե աշխատանքը բնական է ավարտվել)
         if: success()
         run: |
           git config --global user.name "AWEC Planetary Bot"
@@ -81,7 +93,6 @@ jobs:
           git push origin main
 
       - name: Trigger Next Run (24/7 Loop)
-        # Հաջորդ ցիկլի ավտոմատ միացումը (միայն եթե նախորդը հաջողությամբ ավարտվել է)
         if: success()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
