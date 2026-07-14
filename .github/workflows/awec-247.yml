@@ -41,7 +41,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "🔄 Փնտրում ենք վերջին տվյալների բազան..."
-          # Գտնում ենք 'latest-state' թագով հիմնական աշխատանքային Release-ը
           RELEASE_DATA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             https://api.github.com/repos/${{ github.repository }}/releases/tags/latest-state || true)
           
@@ -66,7 +65,7 @@ jobs:
           timeout 18000 python collector_247.py || true
 
       - name: Export DB to Plain Text
-        if: always() # Աշխատում է ՄԻՇՏ (նույնիսկ եթե ձեռքով Cancel ես արել)
+        if: always()
         run: |
           python -c "
           import sqlite3
@@ -100,77 +99,88 @@ jobs:
             FILE_SIZE=0
           fi
           
-          # 2GB սահմանափակման ստուգում (2,147,483,648 bytes)
+          # 2GB սահմանափակման ստուգում
           LIMIT_2GB=2147483648
           if [ $FILE_SIZE -ge $LIMIT_2GB ]; then
             echo "🚨 FILE REACHED 2GB LIMIT!"
             echo "REACHED_2GB=true" >> $GITHUB_OUTPUT
+            TAG_NAME="v-chunk-$(date -d '+4 hours' +'%Y%m%d_%H%M%S')"
           else
             echo "REACHED_2GB=false" >> $GITHUB_OUTPUT
+            TAG_NAME="latest-state"
           fi
           
           TIMESTAMP=$(date -d '+4 hours' +'%Y%m%d_%H%M%S')
           echo "COUNT=$COUNT" >> $GITHUB_OUTPUT
           echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
           
           if [ -f "links.db" ]; then
             cp links.db "${TIMESTAMP}_links_${COUNT}.db"
             echo "ARCHIVE_FILENAME=${TIMESTAMP}_links_${COUNT}.db" >> $GITHUB_OUTPUT
           fi
 
-      - name: Update Main GitHub Release (Continuous State)
-        if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.REACHED_2GB == 'false'
-        uses: softprops/action-gh-release@v2
+      - name: Handle GitHub Release and Upload Assets with Real-Time Progress
+        if: always() && steps.prep.outputs.COUNT != '0'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: latest-state
-          name: "AWEC - Active Continuous State"
-          body: |
-            ### 📊 AWEC Live Current State
-            - **Վերջին թարմացում:** ${{ steps.prep.outputs.TIMESTAMP }} (Yerevan Time)
-            - **Հղումների ընթացիկ քանակ:** `${{ steps.prep.outputs.COUNT }}`
-            - *Այս Release-ը ավտոմատ overwrite է լինում ամեն ցիկլի վերջում, քանի դեռ բազան < 2GB է։*
-          draft: false
-          prerelease: false
-          files: |
-            links.db
-            links.txt
-
-      - name: Create New Chunk Release (If 2GB Reached)
-        if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.REACHED_2GB == 'true'
-        uses: softprops/action-gh-release@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: "v-chunk-${{ steps.prep.outputs.TIMESTAMP }}"
-          name: "AWEC Backup [2GB CHUNK] - v${{ steps.prep.outputs.TIMESTAMP }}"
-          body: |
-            ### ⚠️ 2GB Limit Reached - New Chunk Saved
-            - **Հղումների քանակ:** `${{ steps.prep.outputs.COUNT }}`
-            - **Ամսաթիվ:** ${{ steps.prep.outputs.TIMESTAMP }}
-          draft: false
-          prerelease: false
-          files: |
-            links.db
-            links.txt
+          TAG: ${{ steps.prep.outputs.TAG_NAME }}
+        run: |
+          echo "📁 Ֆայլերի չափսերը ստուգում:"
+          ls -lh links.db links.txt
+          
+          echo "🔄 Ստեղծում/թարմացնում ենք GitHub Release-ը..."
+          # 1. Ստեղծում ենք Release կամ թարմացնում գոյություն ունեցողը API-ով
+          RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG | jq -r '.id')
+          
+          if [ "$RELEASE_ID" == "null" ] || [ -z "$RELEASE_ID" ]; then
+            # Եթե չկա, սարքում ենք նորը
+            RELEASE_ID=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+              -d "{\"tag_name\":\"$TAG\",\"name\":\"AWEC State $TAG\",\"body\":\"Links count: ${{ steps.prep.outputs.COUNT }}\"}" \
+              https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.id')
+          fi
+          
+          # 2. Ջնջում ենք հին ֆայլերը Release-ի միջից, որ նորերը overwrite լինեն
+          ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets)
+          for asset_id in $(echo "$ASSETS" | jq -r '.[] | .id'); do
+            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id
+          done
+          
+          # 3. ՌԵԱԼ ԹԱՅՄ ՎԵՐԲԵՌՆՈՒՄ (Real-Time progress curl-ով)
+          echo "⬆️ Uploading links.db to GitHub Releases (Real-time progress):"
+          curl -# -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @links.db \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.db"
+          
+          echo -e "\n⬆️ Uploading links.txt to GitHub Releases (Real-time progress):"
+          curl -# -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @links.txt \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.txt"
+          echo -e "\n✅ GitHub Release-ի վերբեռնումը ավարտվեց։"
 
       - name: Upload Snapshot to Internet Archive
         if: always() && steps.prep.outputs.COUNT != '0'
         env:
+          # Բանալիները փոխանցում ենք որպես ավտոմատ միջավայրի փոփոխականներ (Environment variables)
+          # Internet Archive CLI-ն (ia) ինքնուրույն կարդում է հենց այս անուններով փոփոխականները[cite: 1]
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
         run: |
           FILENAME="${{ steps.prep.outputs.ARCHIVE_FILENAME }}"
-          echo "📤 Sending 5-hour snapshot to Archive.org: $FILENAME"
-          ia configure --access-key "$IA_ACCESS_KEY" --secret-key "$IA_SECRET_KEY"
+          echo "📤 Sending snapshot to Archive.org: $FILENAME"
+          # config-ի կարիքը չկա, քանի որ ia-ն ավտոմատ կարդում է վերևի IA_ACCESS_KEY և IA_SECRET_KEY փոփոխականները
           ia upload awec_links_awe_o.s "$FILENAME" \
             --metadata="title:AWEC Harvest $FILENAME" \
             --metadata="mediatype:data" \
             --metadata="collection:opensource"
 
       - name: Trigger Next Loop Automatically
-        if: always() # Միշտ կաշխատի՝ նույնիսկ ձեռքով Cancel անելուց հետո
+        if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
