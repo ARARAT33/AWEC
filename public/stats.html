@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="hy">
+<head>
+    <meta charset="UTF-8">
+    <title>AWEC Stats</title>
+    <style>
+        body { background:#0a0a0a; color:#0f0; font-family:monospace; padding:20px; }
+        .stat-box { border:1px solid #333; padding:10px; margin:10px 0; }
+    </style>
+</head>
+<body>
+    <h1>📈 AWEC Մանրամասն Վիճակագրություն</h1>
+    <div id="statsContainer">Բեռնում...</div>
+    <script>
+        async function fetchStats() {
+            const url = 'https://raw.githubusercontent.com/your-username/your-repo/main/public/stats.json';
+            const r = await fetch(url);
+            const d = await r.json();
+            document.getElementById('statsContainer').innerHTML = `
+                <div class="stat-box">🔗 Հղումներ: ${d.total_links.toLocaleString()}</div>
+                <div class="stat-box">💾 Չափ: ${d.size_human} (${d.size_bytes} բայթ)</div>
+                <div class="stat-box">🕒 Վերջին թարմացում: ${new Date(d.last_update).toLocaleString()}</div>
+            `;
+        }
+        fetchStats();
+        setInterval(fetchStats, 30000);
+    </script>
+</body>
+</html>
