@@ -29,23 +29,21 @@ jobs:
 
       - name: Run Crawler (Max 5 Hours)
         run: |
-          # 1. Օպտիմալացնում ենք աշխատողների քանակը (50-ը լավագույնն է Actions-ի համար)
-          # 2. Ուղղում ենք Seed-ի սառեցումը՝ ստիպելով անմիջապես flush անել բազան սկզբում
+          # Ստիպում ենք սկզբնական seed հղումներին անմիջապես գրվել բազա (flush լինել),
+          # որպեսզի հերթը (Queue) դատարկ չմնա ու ծրագիրը չսառչի սկզբում:
           python -c "
-          with open('collector_247_2.py', 'r') as f:
+          with open('collector_247.py', 'r') as f:
               code = f.read()
           
-          # Փոխում ենք աշխատողների քանակը 50-ի
-          code = code.replace('max_workers: int = 2000', 'max_workers: int = 50')
-          
-          # Գտնում ենք _seed ֆունկցիայի ավարտը և ավելացնում բազայի անհապաղ flush
           old_seed_flush = 'if batch:\n            await self.db.insert_batch(batch)'
           new_seed_flush = 'if batch:\n            await self.db.insert_batch(batch)\n            await self.db._flush()'
-          code = code.replace(old_seed_flush, new_seed_flush)
           
-          with open('collector_247.py', 'w') as f:
-              f.write(code)
+          if old_seed_flush in code:
+              code = code.replace(old_seed_flush, new_seed_flush)
+              with open('collector_247.py', 'w') as f:
+                  f.write(code)
           "
+          # Գործարկում ենք բուն ֆայլը (աշխատողների քանակը կարդացվում է հենց Python-ից)
           python collector_247.py
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
