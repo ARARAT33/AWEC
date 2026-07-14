@@ -6,13 +6,10 @@ import re
 import sys
 import sqlite3
 import shutil
-import warnings
 from datetime import datetime, timedelta, timezone
 
-warnings.filterwarnings("ignore")
-
 # ---------------------------------------------------------------------------
-# CONFIGURATION
+# 1. ԿԱՐԳԱՎՈՐՈՒՄՆԵՐ
 # ---------------------------------------------------------------------------
 DB_PATH = "links.db"
 LOG_FILE = "logs/crawler.log"
@@ -20,17 +17,14 @@ IA_IDENTIFIER = "awec_links_awe_o.s"
 IA_ACCESS_KEY = os.environ.get("IA_ACCESS_KEY")
 IA_SECRET_KEY = os.environ.get("IA_SECRET_KEY")
 
-# Գերարագ կանոնավոր արտահայտություն (Regex)՝ ցանկացած տեսակի ուղիղ ֆայլեր և հղումներ քաղելու համար
-LINK_PATTERN = re.compile(
-    r'(?:https?|ftp|ftps|ssh|git|svn|ws|wss|magnet|ipfs|ipns|onion|file)://[^\s<>"\'+]+', 
-    re.IGNORECASE
-)
+# Գերարագ Regex՝ ցանկացած տեսակի հղում RAW տեքստից միանգամից քաղելու համար
+LINK_PATTERN = re.compile(r'https?://[^\s<>"\'+]+', re.IGNORECASE)
 
-# ---------------------------------------------------------------------------
-# UTILS & TIME
-# ---------------------------------------------------------------------------
 os.makedirs("logs", exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# 2. ՕԺԱՆԴԱԿ ՖՈՒՆԿՑԻԱՆԵՐ
+# ---------------------------------------------------------------------------
 def log(msg):
     t = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=4))).strftime("%Y-%m-%d %H:%M:%S")
     print(f"{t} [AWEC] {msg}")
@@ -42,36 +36,25 @@ def get_yerevan_time():
     return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=4)))
 
 # ---------------------------------------------------------------------------
-# DATABASE (SQLite optimized for raw write speed)
+# 3. ԳԵՐԱՐԱԳ ՇԱՐԺԻՉԸ (ԱՌԱՆՑ ՀԵՐԹԻ)
 # ---------------------------------------------------------------------------
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=OFF")  # Գերարագ գրելու համար (առանց սպասելու սկավառակին)
-    conn.execute("PRAGMA cache_size=-128000") # 128MB Cache հիշողության (RAM) մեջ
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS urls (
-            url TEXT PRIMARY KEY,
-            status TEXT DEFAULT 'pending'
-        )
-    """)
-    conn.commit()
-    return conn
-
-# ---------------------------------------------------------------------------
-# MEGASPEED STREAMING CRAWLER
-# ---------------------------------------------------------------------------
-class FastCrawler:
+class FastHarvester:
     def __init__(self):
-        self.conn = init_db()
-        self.queue = set()
+        self.db_conn = None
         self.session = None
         self.active = True
-        self.total_inserted_today = 0  # Օրվա ընթացքում հավաքվածների քաունթեր
+        self.total_saved = 0  # Բազա գրվածների իրական քանակը
+
+    def init_db(self):
+        self.db_conn = sqlite3.connect(DB_PATH)
+        self.db_conn.execute("PRAGMA journal_mode=WAL")
+        self.db_conn.execute("PRAGMA synchronous=OFF")  # Գերարագ գրելու համար (առանց սկավառակին սպասելու)
+        self.db_conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
+        self.db_conn.commit()
 
     async def upload_to_ia(self, file_path):
         if not IA_ACCESS_KEY or not IA_SECRET_KEY:
-            log("⚠️ IA Keys missing. Skip upload.")
+            log("⚠️ IA Keys are missing! Skipping upload.")
             return False
         
         filename = os.path.basename(file_path)
@@ -88,68 +71,86 @@ class FastCrawler:
                 with open(file_path, "rb") as f:
                     async with up_session.put(upload_url, data=f, headers=headers) as r:
                         if r.status == 200:
-                            log("🎉 IA Upload successful!")
+                            log("🎉 Internet Archive Upload successful!")
                             return True
-                        log(f"❌ IA Failed: {r.status}")
+                        log(f"❌ Upload failed: {r.status}")
         except Exception as e:
             log(f"❌ Upload error: {e}")
         return False
 
-    async def check_and_archive(self):
-        """Հսկում է Երևանի ժամը (23:55-ին ավտոմատ ուղարկում է)"""
+    async def archive_routine(self):
+        """Ամեն օր 23:55-ին պահպանում և ուղարկում է Archive.org"""
         while True:
             now = get_yerevan_time()
             if now.hour == 23 and now.minute == 55:
                 log("🕒 It's 23:55! Executing Daily Archive...")
                 self.active = False
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 
-                # Հաշվում ենք քանակը
-                total = self.conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
+                self.db_conn.commit()
+                self.db_conn.close()
+                
+                # Արխիվի ֆայլի անունը
                 date_str = now.strftime("%m_%d_%Y")
-                archive_name = f"{date_str}_links_{total}.db"
+                archive_name = f"{date_str}_links_{self.total_saved}.db"
                 
-                # Պատճենում և ուղարկում ենք
-                self.conn.commit()
-                self.conn.close()
                 shutil.copy(DB_PATH, archive_name)
-                
                 await self.upload_to_ia(archive_name)
                 
                 if os.path.exists(archive_name):
                     os.remove(archive_name)
-                
-                # Ջնջում ենք հինը, սկսում նորը 00:00-ին
-                log("Waiting for 00:00 to start fresh session...")
-                while get_yerevan_time().hour != 0:
-                    await asyncio.sleep(5)
-                
                 if os.path.exists(DB_PATH):
                     os.remove(DB_PATH)
                     for ext in ['-wal', '-shm', '-journal']:
                         if os.path.exists(DB_PATH + ext):
                             os.remove(DB_PATH + ext)
+
+                log("Waiting for midnight (00:00) to start a new clean session...")
+                while get_yerevan_time().hour != 0:
+                    await asyncio.sleep(5)
                 
-                self.conn = init_db()
-                self.queue.clear()
-                self.total_inserted_today = 0
-                await self.seed()
+                self.total_saved = 0
+                self.init_db()
                 self.active = True
-                
+
             await asyncio.sleep(10)
 
-    async def seed(self):
+    async def fetch_and_save(self, url):
+        """Կարդում է կայքը, քաղում հղումները և միանգամից գրում բազա"""
+        if not self.active:
+            return
+
+        try:
+            async with self.session.get(url, ssl=False, timeout=5) as resp:
+                if resp.status == 200:
+                    text = await resp.text(errors='ignore')
+                    found = LINK_PATTERN.findall(text)
+                    
+                    # Զտում ենք չափազանց երկար ու սխալ հղումները
+                    valid_links = [(l,) for l in found if len(l) < 300 and l.startswith(('http://', 'https://'))]
+                    
+                    if valid_links:
+                        cursor = self.db_conn.cursor()
+                        # Միանգամից գրում ենք բազայի մեջ առանց հերթի
+                        cursor.executemany("INSERT OR IGNORE INTO urls (url) VALUES (?)", valid_links)
+                        self.db_conn.commit()
+                        self.total_saved += cursor.rowcount
+        except Exception:
+            pass
+
+    async def run(self):
+        log("🚀 AWEC Non-Stop Fast Harvester Started...")
+        self.init_db()
+        
+        # 300 զուգահեռ միացումների հնարավորություն
+        connector = aiohttp.TCPConnector(limit=300, force_close=True, ssl=False)
+        self.session = aiohttp.ClientSession(connector=connector)
+        
+        # Ֆոնային արխիվացումը
+        asyncio.create_task(self.archive_routine())
+
+        # 50 Mega Seeds
         seeds = [
-            "https://curlie.org/en",
-            "https://dmoz-odp.org/",
-            "https://www.directoryofdirectories.com/",
-            "https://archive.org/details/software",
-            "https://thepiratebay.org/",
-            "https://libgen.is/",
-            "https://news.ycombinator.com/lists",
-            "https://reddit.com/r/all",
-            "https://github.com/collections",
-            "https://en.wikipedia.org/wiki/Portal:Contents"
             "https://github.com/sindresorhus/awesome",
             "https://en.wikipedia.org/wiki/Special:AllPages",
             "https://en.wikipedia.org/wiki/Special:RecentChanges",
@@ -184,7 +185,7 @@ class FastCrawler:
             "https://steamcommunity.com/discussions",
             "https://itch.io/games",
             "https://bandcamp.com/tag/electronic",
-            "soundcloud.com/discover",
+            "https://soundcloud.com/discover",
             "https://www.mixcloud.com/discover/",
             "https://open.spotify.com/genre/discover-page",
             "https://www.discogs.com/search/",
@@ -201,74 +202,21 @@ class FastCrawler:
             "https://core.ac.uk/",
             "https://www.wikidata.org/wiki/Wikidata:Main_Page"
         ]
-        for s in seeds:
-            self.queue.add(s)
-            self.conn.execute("INSERT OR IGNORE INTO urls (url, status) VALUES (?, 'pending')", (s,))
-        self.conn.commit()
-        db_count = self.conn.execute('SELECT COUNT(*) FROM urls').fetchone()[0]
-        log(f"🌱 Seeded. Total DB: {db_count} links.")
 
-    async def worker(self):
-        """Անսահմանափակ արագագործ worker"""
-        while True:
-            if not self.active or not self.queue:
-                await asyncio.sleep(0.01)  # Շատ կարճ սպասում՝ CPU-ն չծանրաբեռնելու համար
-                continue
-            
-            url = self.queue.pop()
-            try:
-                # Թեթև հարցում առանց SSL ստուգման ու ավելորդ գլխամասերի
-                async with self.session.get(url, ssl=False, timeout=5) as resp:
-                    if resp.status == 200:
-                        text = await resp.text(errors='ignore')
-                        # Կայծակնային Regex որոնում
-                        found = LINK_PATTERN.findall(text)
-                        
-                        if found:
-                            # Զտում ենք չափազանց երկար հղումները
-                            valid_links = [(l, 'pending') for l in found if len(l) < 500]
-                            
-                            # Միանգամից Batch (Փաթեթային) գրում բազա
-                            cursor = self.conn.cursor()
-                            cursor.executemany(
-                                "INSERT OR IGNORE INTO urls (url, status) VALUES (?, 'pending')",
-                                valid_links
-                            )
-                            self.conn.commit()
-                            
-                            # Քանակի ավելացում
-                            self.total_inserted_today += cursor.rowcount
-                            
-                            # Լցնում ենք հերթը շղթան շարունակելու համար
-                            for item in valid_links[:150]:
-                                if len(self.queue) < 150_000:
-                                    self.queue.add(item[0])
-            except Exception:
-                pass
-
-    async def run(self):
-        log("🚀 AWEC Ultra-Speed Engine Started...")
-        # Օպտիմալ միացումների քանակ (բարձրացրել ենք մինչև 300 զուգահեռ սեսիա)
-        connector = aiohttp.TCPConnector(limit=300, ttl_dns_cache=300, ssl=False)
-        self.session = aiohttp.ClientSession(connector=connector)
+        # Գործարկում ենք բոլոր seed-երը միաժամանակ
+        tasks = [asyncio.create_task(self.fetch_and_save(url)) for url in seeds]
         
-        await self.seed()
-        
-        asyncio.create_task(self.check_and_archive())
-        
-        # Գործարկում ենք 180 կայծակնային զուգահեռ Worker-ներ
-        workers = [asyncio.create_task(self.worker()) for _ in range(180)]
-        
+        # Պարբերական Լոգեր (Ամեն 2 վայրկյանը մեկ կոնսոլում ցույց է տալիս, թե ինչքան հղում գրվեց db-ում)
         try:
-            while True:
-                await asyncio.sleep(2)  # Ամեն 2 վայրկյանը մեկ թարմացվող լոգ
-                if self.active:
-                    total_in_db = self.conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
-                    log(f"📊 [PROGRESS] Total URL count in links.db: {total_in_db} | Queue: {len(self.queue)} | Added this session: +{self.total_inserted_today}")
+            while self.active:
+                await asyncio.sleep(2)
+                # Կարդում ենք SQL-ից իրական քանակը, որ համոզվենք, որ տվյալները գրվել են
+                real_db_count = self.db_conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
+                log(f"📊 [LIVE STATE] Links inside links.db: {real_db_count} | Session Added: +{self.total_saved}")
         except (KeyboardInterrupt, SystemExit):
-            self.conn.commit()
-            self.conn.close()
+            self.db_conn.commit()
+            self.db_conn.close()
             await self.session.close()
 
 if __name__ == "__main__":
-    asyncio.run(FastCrawler().run())
+    asyncio.run(FastHarvester().run())
