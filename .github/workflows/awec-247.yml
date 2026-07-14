@@ -1,9 +1,9 @@
 name: AWEC Planetary Crawler 24/7
 
 on:
-  workflow_dispatch: # Ձեռքով միացնելու համար
+  workflow_dispatch:
   repository_dispatch:
-    types: [trigger_crawler] # Ինքնագործարկման ազդակը
+    types: [trigger_crawler]
 
 permissions: write-all
 
@@ -21,7 +21,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          # Հեռացրել ենք cache-ը, որպեսզի requirements.txt չփնտրի ու սխալ չտա
 
       - name: Install Dependencies
         run: |
@@ -30,12 +29,20 @@ jobs:
 
       - name: Run Crawler (Max 5 Hours)
         run: |
-          # Օպտիմալացնում ենք զուգահեռ աշխատողներին Actions-ի թույլ սերվերի համար
-          # Գործարկում ենք քո տրամադրած ֆայլը
+          # 1. Օպտիմալացնում ենք աշխատողների քանակը (50-ը լավագույնն է Actions-ի համար)
+          # 2. Ուղղում ենք Seed-ի սառեցումը՝ ստիպելով անմիջապես flush անել բազան սկզբում
           python -c "
-          with open('collector_247.py', 'r') as f:
+          with open('collector_247_2.py', 'r') as f:
               code = f.read()
-          code = code.replace('max_workers: int = 2000', 'max_workers: int = 150')
+          
+          # Փոխում ենք աշխատողների քանակը 50-ի
+          code = code.replace('max_workers: int = 2000', 'max_workers: int = 50')
+          
+          # Գտնում ենք _seed ֆունկցիայի ավարտը և ավելացնում բազայի անհապաղ flush
+          old_seed_flush = 'if batch:\n            await self.db.insert_batch(batch)'
+          new_seed_flush = 'if batch:\n            await self.db.insert_batch(batch)\n            await self.db._flush()'
+          code = code.replace(old_seed_flush, new_seed_flush)
+          
           with open('collector_247_2.py', 'w') as f:
               f.write(code)
           "
@@ -60,7 +67,7 @@ jobs:
 
       - name: Wait 30 Seconds & Trigger Next Run
         run: |
-          echo "Սպասում ենք 30 վայրկյան՝ RAM-ը թարմացնելու և հաջորդ ցիկլը սկսելու համար..."
+          echo "Սպասում ենք 30 վայրկյան..."
           sleep 30
           
           curl -L \
