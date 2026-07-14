@@ -1,9 +1,9 @@
 name: AWEC Planetary Crawler 24/7
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Ձեռքով միացնելու հնարավորություն
   repository_dispatch:
-    types: [trigger_crawler]
+    types: [trigger_crawler] # Ինքնագործարկման ցիկլի ազդակը
 
 permissions: write-all
 
@@ -29,24 +29,7 @@ jobs:
 
       - name: Run Crawler (Max 5 Hours)
         run: |
-          # 1. Փոխում ենք await self._seed()-ը asyncio.create_task(self._seed())-ի,
-          # որպեսզի սերմնավորումը չբլոկավորի հիմնական Thread-ը:
-          # 2. Ստիպում ենք seed-ին անմիջապես flush լինել:
-          python -c "
-          with open('collector_247.py', 'r') as f:
-              code = f.read()
-          
-          # Դարձնում ենք ֆոնային task
-          code = code.replace('await self._seed()', 'asyncio.create_task(self._seed())')
-          
-          # Ավելացնում ենք անհապաղ flush seed-ի մեջ
-          old_seed_flush = 'if batch:\n            await self.db.insert_batch(batch)'
-          new_seed_flush = 'if batch:\n            await self.db.insert_batch(batch)\n            await self.db._flush()'
-          code = code.replace(old_seed_flush, new_seed_flush)
-          
-          with open('collector_247.py', 'w') as f:
-              f.write(code)
-          "
+          # Գործարկում ենք մաքուր ու օպտիմալացված collector_247.py-ը
           python collector_247.py
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
