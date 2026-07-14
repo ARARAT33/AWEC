@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="hy">
+<head><meta charset="UTF-8"><title>AWEC Recent Links</title></head>
+<body style="background:#000;color:#0f0;font-family:monospace;padding:20px;">
+    <h1>🔍 Վերջին հղումները</h1>
+    <p>Այս էջը ցուցադրում է վերջին 1000 հավաքված URL-ները (թարմացվում է ամեն ժամ)</p>
+    <pre id="links">Բեռնում...</pre>
+    <script>
+        fetch('https://raw.githubusercontent.com/your-username/your-repo/main/public/recent_links.txt')
+            .then(r => r.text())
+            .then(t => document.getElementById('links').textContent = t);
+    </script>
+</body>
+</html>
