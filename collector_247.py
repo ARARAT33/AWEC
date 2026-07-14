@@ -5,7 +5,6 @@ import os
 import re
 import sys
 import sqlite3
-import shutil
 from datetime import datetime, timedelta, timezone
 
 DB_PATH = "links.db"
@@ -31,18 +30,28 @@ class ContinuousHarvester:
         self.session = None
         self.active = True
         self.total_saved = 0
-        self.visited_urls = set()
         self.active_pool = list()
 
     def init_db(self):
         self.db_conn = sqlite3.connect(DB_PATH)
-        # Օգտագործում ենք TRUNCATE ռեժիմ WAL-ի փոխարեն, որպեսզի տվյալները միանգամից գրվեն հիմնական ֆայլում
+        # Օգտագործում ենք TRUNCATE ռեժիմ WAL-ի փոխարեն, որպեսզի տվյալները միանգամից գրվեն հիմնական ֆայլում[cite: 1]
         self.db_conn.execute("PRAGMA journal_mode=TRUNCATE")
         self.db_conn.execute("PRAGMA synchronous=NORMAL")
+        self.db_conn.execute("PRAGMA cache_size=-500000") # 500MB RAM cache արագ Query-ների համար
+        # PRIMARY KEY-ը երաշխավորում է, որ երբեք նույն հղումը չի կրկնվի[cite: 1]
         self.db_conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
         self.db_conn.commit()
 
     def seed(self):
+        # Ստուգում ենք՝ արդյո՞ք բազան արդեն ունի տվյալներ (որ անիմաստ նորից սերմեր չգցենք)
+        count = self.db_conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
+        if count > 0:
+            log(f"📚 Բազան արդեն ունի {count} հղում։ Վերցնում ենք վերջին 5000-ը որպես աշխատանքային հերթ...")
+            # Լցնում ենք աշխատանքային հերթը (Queue) բազայի վերջին հղումներով
+            cursor = self.db_conn.execute("SELECT url FROM urls ORDER BY rowid DESC LIMIT 5000")
+            self.active_pool = [row[0] for row in cursor.fetchall()]
+            return
+
         seeds = [
             "https://github.com/sindresorhus/awesome",
             "https://en.wikipedia.org/wiki/Special:AllPages",
@@ -95,10 +104,8 @@ class ContinuousHarvester:
             "https://core.ac.uk/",
             "https://www.wikidata.org/wiki/Wikidata:Main_Page"
         ]
-        for s in seeds:
-            self.visited_urls.add(s)
-            self.active_pool.append(s)
-            self.db_conn.execute("INSERT OR IGNORE INTO urls (url) VALUES (?)", (s,))
+        self.active_pool.extend(seeds)
+        self.db_conn.executemany("INSERT OR IGNORE INTO urls (url) VALUES (?)", [(s,) for s in seeds])
         self.db_conn.commit()
 
     async def worker(self):
@@ -120,14 +127,16 @@ class ContinuousHarvester:
                         new_links = []
                         for l in found:
                             if len(l) < 300 and l.startswith(('http://', 'https://')):
-                                if l not in self.visited_urls:
-                                    self.visited_urls.add(l)
-                                    new_links.append(l)
+                                # redundant 'set' check-ը հանված է RAM խնայելու համար
+                                new_links.append(l)
 
                         if new_links:
                             cursor = self.db_conn.cursor()
+                            # INSERT OR IGNORE-ը երաշխավորում է, որ միայն բացարձակ եզակի հղումները կգրվեն
                             cursor.executemany("INSERT OR IGNORE INTO urls (url) VALUES (?)", [(link,) for link in new_links])
                             self.db_conn.commit()
+                            
+                            # cursor.rowcount-ով հաշվում ենք միայն իրականում ավելացված նոր հղումները
                             self.total_saved += cursor.rowcount
                             
                             if len(self.active_pool) < 100000:
@@ -155,7 +164,6 @@ class ContinuousHarvester:
         except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
             pass
         finally:
-            # Սա երաշխավորում է, որ ցանկացած անջատման դեպքում տվյալները 100% կգրվեն սկավառակին
             log("💾 Safely saving database before exit...")
             self.db_conn.commit()
             self.db_conn.close()
