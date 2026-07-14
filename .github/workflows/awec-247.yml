@@ -166,14 +166,16 @@ jobs:
       - name: Upload Snapshot to Internet Archive
         if: always() && steps.prep.outputs.COUNT != '0'
         env:
-          # Բանալիները փոխանցում ենք որպես ավտոմատ միջավայրի փոփոխականներ (Environment variables)
-          # Internet Archive CLI-ն (ia) ինքնուրույն կարդում է հենց այս անուններով փոփոխականները[cite: 1]
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
         run: |
           FILENAME="${{ steps.prep.outputs.ARCHIVE_FILENAME }}"
           echo "📤 Sending snapshot to Archive.org: $FILENAME"
-          # config-ի կարիքը չկա, քանի որ ia-ն ավտոմատ կարդում է վերևի IA_ACCESS_KEY և IA_SECRET_KEY փոփոխականները
+          
+          # Ավտոմատ կոնֆիգուրացնում ենք ia քլիենթը մեր գաղտնի բանալիներով
+          printf "%s\n%s\n" "$IA_ACCESS_KEY" "$IA_SECRET_KEY" | ia configure
+          
+          # Վերբեռնում ենք ֆայլը
           ia upload awec_links_awe_o.s "$FILENAME" \
             --metadata="title:AWEC Harvest $FILENAME" \
             --metadata="mediatype:data" \
