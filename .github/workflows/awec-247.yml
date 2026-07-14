@@ -1,17 +1,19 @@
-name: "AWEC 24/7 Hyper Collect"
+name: "AWEC 24/7 Continuous Crawl"
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # յուր. 6 ժամը մեկ (00,06,12,18 UTC)
+    - cron: '0 */6 * * *'          # fallback every 6 hours
+  repository_dispatch:              # self‑trigger via API
+    types: [crawl-restart]
   workflow_dispatch:
 
 jobs:
   hyper-collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 360      # 6 ժամ, որից հետո ավտոմատ կանգնում է
+    timeout-minutes: 360            # 6‑hour hard limit
     permissions:
       contents: write
-      issues: write
+      actions: write               # needed for self‑trigger
     steps:
       - uses: actions/checkout@v4
         with:
@@ -22,24 +24,35 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install aiohttp aiofiles beautifulsoup4 lxml internetarchive
+        run: pip install aiohttp beautifulsoup4 lxml internetarchive
 
-      - name: Run 24/7 Collector
+      - name: Run Planetary Crawler (5h50m)
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
         run: python collector_247.py
 
-      - name: Commit updated DB and stats
+      - name: Commit updated database & stats
         run: |
           git config user.name "AWEC-Bot"
           git config user.email "bot@awec.local"
-          git add links.db public/stats.json TMPLinks/
-          git diff --quiet && git diff --staged --quiet || (git commit -m "💾 DB & stats updated" && git push)
+          git add links.db public/stats.json logs/ 2>/dev/null || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "💾 checkpoint $(date +%H:%M)" && git push)
 
-      - name: Deploy to GitHub Pages
+      - name: Deploy public site to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./public
           keep_files: true
+
+      - name: Trigger next run (self‑restart loop)
+        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}     # personal access token with repo + actions:write
+        run: |
+          # wait a few seconds to let everything settle, then fire the next run
+          sleep 20
+          gh workflow run "AWEC 24/7 Continuous Crawl" \
+            --ref main \
+            --field dispatch_type=crawl-restart
