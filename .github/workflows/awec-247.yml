@@ -37,7 +37,6 @@ jobs:
 
       - name: Install Python Requirements
         run: |
-          # Օգտագործում ենք ակտիվ Python-ը գրադարանները տեղադրելու համար, որպեսզի sys.executable-ը հաստատ տեսնի դրանք
           python -m pip install --upgrade pip
           python -m pip install aiohttp internetarchive beautifulsoup4 requests
 
@@ -99,6 +98,7 @@ jobs:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           echo "🚀 Սկսում ենք սարդի աշխատանքը..."
           
@@ -111,6 +111,7 @@ jobs:
           import os
           import time
           import sys
+          import json
 
           start_time = time.time()
           five_hours = 18000 
@@ -125,10 +126,9 @@ jobs:
               
               print(f'🕷️ Միացնում ենք սարդը {remaining_time} վայրկյանով...')
               
-              # Աշխատեցնում ենք սարդը
+              # Օգտագործվում է քո կողմից նշված ճիշտ սկրիպտը՝ collector_247.py
               process = subprocess.Popen([sys.executable, 'collector_247.py'])
               
-              # Սպասում ենք կարճ ժամանակ, որ տեսնենք՝ սարդը սկզբնական ImportError-ով կամ այլ սխալով միանգամից չի՞ ընկնում
               time.sleep(3)
               ret = process.poll()
               if ret is not None and ret != 0:
@@ -157,11 +157,28 @@ jobs:
                   print('📦 Սկսում ենք միջանկյալ 1.99 ԳԲ Release-ի պատրաստումը...')
                   os.system('sqlite3 links.db \"PRAGMA journal_mode=DELETE;\"')
                   
-                  os.system('python -c \"import sqlite3, os; conn=sqlite3.connect(\'links.db\'); cur=conn.cursor(); cur.execute(\'SELECT url FROM urls\'); urls=cur.fetchall(); f=open(\'links.txt\', \'w\', encoding=\'utf-8\'); [f.write(u[0]+\'\\n\') for u in urls]; f.close(); conn.close()\"')
+                  os.system('python -c \"import sqlite3; conn=sqlite3.connect(\'links.db\'); cur=conn.cursor(); cur.execute(\'SELECT url FROM urls\'); urls=cur.fetchall(); f=open(\'links.txt\', \'w\', encoding=\'utf-8\'); [f.write(u[0]+\'\\n\') for u in urls]; f.close(); conn.close()\"')
                   
                   timestamp = time.strftime('%Y%m%d_%H%M%S')
                   tag = f'v-chunk-{timestamp}'
-                  os.system(f'curl -s -X POST -H \"Authorization: token {os.environ[\"GITHUB_TOKEN\"]}\" -d \"{{\\\"tag_name\\\":\\\"{tag}\\\",\\\"name\\\":\\\"AWEC Split {tag}\\\",\\\"body\\\":\\\"Automated split at 1.99GB limit.\\\"}}\" https://api.github.com/repos/{os.environ[\"GITHUB_REPOSITORY\"]}/releases')
+                  repo = os.environ['GITHUB_REPOSITORY']
+                  token = os.environ['GITHUB_TOKEN']
+                  
+                  create_release_cmd = f'''curl -s -X POST -H "Authorization: token {token}" -d "{{\\\"tag_name\\\":\\\"{tag}\\\",\\\"name\\\":\\\"AWEC Split {tag}\\\",\\\"body\\\":\\\"Automated split at 1.99GB limit.\\\"}}" https://api.github.com/repos/{repo}/releases'''
+                  res = os.popen(create_release_cmd).read()
+                  
+                  try:
+                      release_data = json.loads(res)
+                      release_id = release_data.get('id')
+                      if release_id:
+                          print(f'✅ Միջանկյալ Release-ը ստեղծվել է (ID: {release_id})։ Սկսում ենք ֆայլերի վերբեռնումը -T-ով...')
+                          # Անվտանգ վերբեռնում առանց հիշողության (RAM) սպառման
+                          os.system(f'curl -# -X POST -H "Authorization: token {token}" -H "Content-Type: application/octet-stream" -T links.db "https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name=links.db"')
+                          os.system(f'curl -# -X POST -H "Authorization: token {token}" -H "Content-Type: text/plain" -T links.txt "https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name=links.txt"')
+                      else:
+                          print('🚨 Չհաջողվեց ստանալ Release ID-ն։ Response:', res)
+                  except Exception as ex:
+                      print('🚨 Սխալ Release-ի ստեղծման/վերբեռնման ընթացքում:', ex)
                   
                   if os.path.exists('links.db'):
                       os.remove('links.db')
@@ -169,7 +186,6 @@ jobs:
                       os.remove('links.txt')
                   print('✅ Միջանկյալ Release-ը պատրաստ է։ Շարունակում ենք հաջորդ մասի crawl-ը...')
               else:
-                  # Եթե սարդն ավարտել է աշխատանքը կամ ժամանակը սպառվել է
                   break
           "
 
@@ -236,16 +252,17 @@ jobs:
             https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.id')
           
           if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
+            # -T-ի շնորհիվ ֆայլը կվերբեռնվի սթրիմով՝ լիովին բացառելով 'out of memory' սխալը
             curl -# -X POST \
               -H "Authorization: token $GITHUB_TOKEN" \
               -H "Content-Type: application/octet-stream" \
-              --data-binary @links.db \
+              -T links.db \
               "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.db"
             
             curl -# -X POST \
               -H "Authorization: token $GITHUB_TOKEN" \
               -H "Content-Type: text/plain" \
-              --data-binary @links.txt \
+              -T links.txt \
               "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.txt"
           fi
 
@@ -277,8 +294,9 @@ jobs:
           echo "💤 Սպասում ենք 30 վայրկյան..."
           sleep 30
           
+          # Այստեղ ստուգում և դիմում ենք հենց քո նշած awec-247.yml ֆայլի հերթին
           RUNS_COUNT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/crawler.yml/runs?status=queued" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/runs?status=queued" \
             | jq '.total_count')
           
           if [ "$RUNS_COUNT" -eq 0 ] || [ -z "$RUNS_COUNT" ]; then
@@ -286,7 +304,7 @@ jobs:
             curl -X POST \
               -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/actions/workflows/crawler.yml/dispatches \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/dispatches \
               -d '{"ref":"main"}'
           else
             echo "ℹ️ Հերթում արդեն կա սպասող աշխատանք։"
