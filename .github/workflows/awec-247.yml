@@ -37,8 +37,9 @@ jobs:
 
       - name: Install Python Requirements
         run: |
-          pip install --upgrade pip
-          pip install aiohttp internetarchive beauty-soup-4 requests || true
+          # Օգտագործում ենք ակտիվ Python-ը գրադարանները տեղադրելու համար, որպեսզի sys.executable-ը հաստատ տեսնի դրանք
+          python -m pip install --upgrade pip
+          python -m pip install aiohttp internetarchive beautifulsoup4 requests
 
       - name: Download Last DB with Progress (%)
         env:
@@ -52,7 +53,6 @@ jobs:
           
           if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
             echo "📥 Գտնվեց նախորդ բազան։ Ներբեռնում ենք..."
-            # Օգտագործում ենք pv կամ curl-ի ստանդարտ առաջընթացի տողը %-ով ցույց տալու համար
             curl -L -H "Authorization: token $GITHUB_TOKEN" \
                  -H "Accept: application/octet-stream" \
                  -o links.db "$DOWNLOAD_URL" --progress-bar
@@ -70,7 +70,6 @@ jobs:
             if [ "$INTEGRITY" != "ok" ] || [[ "$INTEGRITY" == *"error"* ]] || [[ "$INTEGRITY" == *"malformed"* ]]; then
               echo "⚠️ Բազան վնասված է։ Սկսում ենք բուժման գործընթացը..."
               
-              # Հաշվում ենք հին տողերի քանակը (եթե հնարավոր է կարդալ)
               OLD_ROWS=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo "0")
               
               mv links.db links_corrupted.db
@@ -103,13 +102,10 @@ jobs:
         run: |
           echo "🚀 Սկսում ենք սարդի աշխատանքը..."
           
-          # Բացում ենք WAL ռեժիմը բազայի համար՝ արագության և անվտանգության համար
           if [ -f "links.db" ]; then
             sqlite3 links.db "PRAGMA journal_mode=WAL;" || true
           fi
 
-          # Այս Python կոդը կաշխատեցնի քո collector_247.py-ը և զուգահեռ կհետևի ֆայլի չափսին։
-          # Եթե ֆայլը դառնա 1.99 ԳԲ, այն ավտոմատ կդադարեցնի սարդը, կանի Release ու կշարունակի։
           python -c "
           import subprocess
           import os
@@ -117,21 +113,28 @@ jobs:
           import sys
 
           start_time = time.time()
-          five_hours = 18000 # 5 ժամ վայրկյաններով
-          limit_bytes = 2136746229 # 1.99 GB բայթերով
+          five_hours = 18000 
+          limit_bytes = 2136746229 # 1.99 GB
 
           while True:
-              remaining_time = int(five_hours - (time.time() - start_time))
+              elapsed = time.time() - start_time
+              remaining_time = int(five_hours - elapsed)
               if remaining_time <= 0:
                   print('⏰ 5 ժամը լրացավ։ Ավարտում ենք աշխատանքը։')
                   break
               
               print(f'🕷️ Միացնում ենք սարդը {remaining_time} վայրկյանով...')
               
-              # Աշխատեցնում ենք սարդը որպես ենթապրոցես
+              # Աշխատեցնում ենք սարդը
               process = subprocess.Popen([sys.executable, 'collector_247.py'])
               
-              # Հետևում ենք ֆայլի չափսին ամեն 10 վայրկյանը մեկ
+              # Սպասում ենք կարճ ժամանակ, որ տեսնենք՝ սարդը սկզբնական ImportError-ով կամ այլ սխալով միանգամից չի՞ ընկնում
+              time.sleep(3)
+              ret = process.poll()
+              if ret is not None and ret != 0:
+                  print(f'🚨 Սարդը միանգամից վթարի ենթարկվեց Exit Code {ret}-ով։ Դադարեցնում ենք աշխատանքը սխալն ուղղելու համար։')
+                  sys.exit(ret)
+              
               reached_limit = False
               while process.poll() is None:
                   time.sleep(10)
@@ -144,7 +147,6 @@ jobs:
                           reached_limit = True
                           break
                   
-                  # Եթե ընդհանուր 5 ժամ ժամանակը սպառվեց
                   if (time.time() - start_time) >= five_hours:
                       print('⏰ 5 ժամը լրացավ։ Կանգնեցնում ենք պրոցեսը...')
                       process.terminate()
@@ -153,25 +155,21 @@ jobs:
               
               if reached_limit:
                   print('📦 Սկսում ենք միջանկյալ 1.99 ԳԲ Release-ի պատրաստումը...')
-                  # Փակում ենք WAL-ը, որպեսզի ֆայլը ճիշտ պահպանվի
                   os.system('sqlite3 links.db \"PRAGMA journal_mode=DELETE;\"')
                   
-                  # Կատարում ենք արտահանում տեքստային տարբերակի
                   os.system('python -c \"import sqlite3, os; conn=sqlite3.connect(\'links.db\'); cur=conn.cursor(); cur.execute(\'SELECT url FROM urls\'); urls=cur.fetchall(); f=open(\'links.txt\', \'w\', encoding=\'utf-8\'); [f.write(u[0]+\'\\n\') for u in urls]; f.close(); conn.close()\"')
                   
-                  # Ստեղծում ենք միջանկյալ Release GitHub-ում
                   timestamp = time.strftime('%Y%m%d_%H%M%S')
                   tag = f'v-chunk-{timestamp}'
                   os.system(f'curl -s -X POST -H \"Authorization: token {os.environ[\"GITHUB_TOKEN\"]}\" -d \"{{\\\"tag_name\\\":\\\"{tag}\\\",\\\"name\\\":\\\"AWEC Split {tag}\\\",\\\"body\\\":\\\"Automated split at 1.99GB limit.\\\"}}\" https://api.github.com/repos/{os.environ[\"GITHUB_REPOSITORY\"]}/releases')
                   
-                  # Ջնջում ենք հին բազան, որ նորից 0-ից սկսի ու 2 ԳԲ-ի սահմանը չանցնի
                   if os.path.exists('links.db'):
                       os.remove('links.db')
                   if os.path.exists('links.txt'):
                       os.remove('links.txt')
                   print('✅ Միջանկյալ Release-ը պատրաստ է։ Շարունակում ենք հաջորդ մասի crawl-ը...')
               else:
-                  # Եթե պրոցեսն ինքն իրեն ավարտվեց կամ ժամանակը սպառվեց
+                  # Եթե սարդն ավարտել է աշխատանքը կամ ժամանակը սպառվել է
                   break
           "
 
