@@ -93,113 +93,38 @@ jobs:
             fi
           fi
 
-      - name: Run AWEC Planetary Crawler (5h Limit & 1.99GB Auto-Release)
-        env:
-          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
-          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+      - name: Run AWEC Planetary Crawler (5 Hours Run Limit)
         run: |
-          echo "🚀 Սկսում ենք սարդի աշխատանքը..."
+          echo "🚀 Սկսում ենք սարդի աշխատանքը 5 ժամով..."
           
-          if [ -f "links.db" ]; then
-            sqlite3 links.db "PRAGMA journal_mode=WAL;" || true
-          fi
-
-          python -c "
-          import subprocess
-          import os
-          import time
-          import sys
-          import json
-
-          start_time = time.time()
-          five_hours = 18000 
-          limit_bytes = 2136746229 # 1.99 GB
-
-          while True:
-              elapsed = time.time() - start_time
-              remaining_time = int(five_hours - elapsed)
-              if remaining_time <= 0:
-                  print('⏰ 5 ժամը լրացավ։ Ավարտում ենք աշխատանքը։')
-                  break
-              
-              print(f'🕷️ Միացնում ենք սարդը {remaining_time} վայրկյանով...')
-              
-              # Օգտագործվում է քո կողմից նշված ճիշտ սկրիպտը՝ collector_247.py
-              process = subprocess.Popen([sys.executable, 'collector_247.py'])
-              
-              time.sleep(3)
-              ret = process.poll()
-              if ret is not None and ret != 0:
-                  print(f'🚨 Սարդը միանգամից վթարի ենթարկվեց Exit Code {ret}-ով։ Դադարեցնում ենք աշխատանքը սխալն ուղղելու համար։')
-                  sys.exit(ret)
-              
-              reached_limit = False
-              while process.poll() is None:
-                  time.sleep(10)
-                  if os.path.exists('links.db'):
-                      size = os.path.getsize('links.db')
-                      if size >= limit_bytes:
-                          print('🚨 Ֆայլի չափսը հասավ 1.99 ԳԲ-ի սահմանին։ Կանգնեցնում ենք սարդը...')
-                          process.terminate()
-                          process.wait()
-                          reached_limit = True
-                          break
-                  
-                  if (time.time() - start_time) >= five_hours:
-                      print('⏰ 5 ժամը լրացավ։ Կանգնեցնում ենք պրոցեսը...')
-                      process.terminate()
-                      process.wait()
-                      break
-              
-              if reached_limit:
-                  print('📦 Սկսում ենք միջանկյալ 1.99 ԳԲ Release-ի պատրաստումը...')
-                  os.system('sqlite3 links.db \"PRAGMA journal_mode=DELETE;\"')
-                  
-                  os.system('python -c \"import sqlite3; conn=sqlite3.connect(\'links.db\'); cur=conn.cursor(); cur.execute(\'SELECT url FROM urls\'); urls=cur.fetchall(); f=open(\'links.txt\', \'w\', encoding=\'utf-8\'); [f.write(u[0]+\'\\n\') for u in urls]; f.close(); conn.close()\"')
-                  
-                  timestamp = time.strftime('%Y%m%d_%H%M%S')
-                  tag = f'v-chunk-{timestamp}'
-                  repo = os.environ['GITHUB_REPOSITORY']
-                  token = os.environ['GITHUB_TOKEN']
-                  
-                  create_release_cmd = f'''curl -s -X POST -H "Authorization: token {token}" -d "{{\\\"tag_name\\\":\\\"{tag}\\\",\\\"name\\\":\\\"AWEC Split {tag}\\\",\\\"body\\\":\\\"Automated split at 1.99GB limit.\\\"}}" https://api.github.com/repos/{repo}/releases'''
-                  res = os.popen(create_release_cmd).read()
-                  
-                  try:
-                      release_data = json.loads(res)
-                      release_id = release_data.get('id')
-                      if release_id:
-                          print(f'✅ Միջանկյալ Release-ը ստեղծվել է (ID: {release_id})։ Սկսում ենք ֆայլերի վերբեռնումը -T-ով...')
-                          # Անվտանգ վերբեռնում առանց հիշողության (RAM) սպառման
-                          os.system(f'curl -# -X POST -H "Authorization: token {token}" -H "Content-Type: application/octet-stream" -T links.db "https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name=links.db"')
-                          os.system(f'curl -# -X POST -H "Authorization: token {token}" -H "Content-Type: text/plain" -T links.txt "https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name=links.txt"')
-                      else:
-                          print('🚨 Չհաջողվեց ստանալ Release ID-ն։ Response:', res)
-                  except Exception as ex:
-                      print('🚨 Սխալ Release-ի ստեղծման/վերբեռնման ընթացքում:', ex)
-                  
-                  if os.path.exists('links.db'):
-                      os.remove('links.db')
-                  if os.path.exists('links.txt'):
-                      os.remove('links.txt')
-                  print('✅ Միջանկյալ Release-ը պատրաստ է։ Շարունակում ենք հաջորդ մասի crawl-ը...')
-              else:
-                  break
-          "
+          # Միացնում ենք քո սարդը ֆոնային ռեժիմով (background)
+          python collector_247.py &
+          SPIDER_PID=$!
+          
+          echo "🕷️ Սարդը միացավ PID $SPIDER_PID-ով։ Սպասում ենք 5 ժամ..."
+          
+          # Սպասում ենք 5 ժամ (18000 վայրկյան)
+          sleep 18000
+          
+          echo "⏰ 5 ժամը լրացավ։ Կանգնեցնում ենք սարդին..."
+          # Ուղարկում ենք SIGINT (Ctrl+C), որպեսզի Python-ը ապահով պահպանի ամեն ինչ
+          kill -2 $SPIDER_PID
+          
+          # Սպասում ենք, որ պրոցեսը լրիվ ավարտվի և բազան փակվի
+          wait $SPIDER_PID || true
+          echo "✅ Սարդը հաջողությամբ կանգնեցվեց։"
 
       - name: Export DB to Plain Text (Final)
         if: always()
         run: |
-          python -c "
+          cat << 'EOF' > export_links.py
           import sqlite3
           import os
           if os.path.exists('links.db'):
               try:
                   conn = sqlite3.connect('links.db')
                   cursor = conn.cursor()
-                  cursor.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='urls'\")
+                  cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='urls'")
                   if cursor.fetchone():
                       cursor.execute('SELECT url FROM urls')
                       urls = cursor.fetchall()
@@ -214,7 +139,8 @@ jobs:
                   print('Export failed:', e)
           else:
               print('links.db not found!')
-          "
+          EOF
+          python export_links.py
 
       - name: Prepare Unique Release Tag and Filename (Final)
         if: always()
@@ -243,28 +169,68 @@ jobs:
         if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.COUNT != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
           TAG: ${{ steps.prep.outputs.TAG_NAME }}
+          COUNT: ${{ steps.prep.outputs.COUNT }}
         run: |
-          echo "🔄 Ստեղծում ենք վերջնական GitHub Release..."
-          
-          RELEASE_ID=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
-            -d "{\"tag_name\":\"$TAG\",\"name\":\"AWEC Run $TAG\",\"body\":\"Successfully collected ${{ steps.prep.outputs.COUNT }} links.\",\"draft\":false,\"prerelease\":false}" \
-            https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.id')
-          
-          if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
-            # -T-ի շնորհիվ ֆայլը կվերբեռնվի սթրիմով՝ լիովին բացառելով 'out of memory' սխալը
-            curl -# -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Content-Type: application/octet-stream" \
-              -T links.db \
-              "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.db"
-            
-            curl -# -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Content-Type: text/plain" \
-              -T links.txt \
-              "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.txt"
-          fi
+          cat << 'EOF' > release_manager.py
+          import os
+          import json
+          import urllib.request
+
+          token = os.environ.get('GITHUB_TOKEN')
+          repo = os.environ.get('REPOSITORY')
+          tag = os.environ.get('TAG')
+          count = os.environ.get('COUNT')
+
+          # 1. Ստեղծում ենք Release
+          release_url = f"https://api.github.com/repos/{repo}/releases"
+          headers = {
+              "Authorization": f"token {token}",
+              "Accept": "application/vnd.github.v3+json",
+              "Content-Type": "application/json"
+          }
+          data = {
+              "tag_name": tag,
+              "name": f"AWEC Run {tag}",
+              "body": f"Successfully collected {count} links.",
+              "draft": False,
+              "prerelease": False
+          }
+
+          req = urllib.request.Request(release_url, data=json.dumps(data).encode('utf-8'), headers=headers, method="POST")
+          try:
+              with urllib.request.urlopen(req) as r:
+                  res = json.loads(r.read().decode())
+                  release_id = res.get('id')
+                  print(f"🎉 Release created successfully. ID: {release_id}")
+          except Exception as e:
+              print(f"❌ Error creating release: {e}")
+              exit(1)
+
+          # 2. Վերբեռնում ենք ֆայլերը (links.db և links.txt)
+          def upload_asset(filepath, name, content_type):
+              if not os.path.exists(filepath):
+                  print(f"⚠️ File {filepath} not found.")
+                  return
+              upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}"
+              headers_upload = {
+                  "Authorization": f"token {token}",
+                  "Content-Type": content_type
+              }
+              try:
+                  with open(filepath, "rb") as f:
+                      file_data = f.read()
+                  req_upload = urllib.request.Request(upload_url, data=file_data, headers=headers_upload, method="POST")
+                  with urllib.request.urlopen(req_upload) as resp:
+                      print(f"✅ Uploaded {name} successfully.")
+              except Exception as e:
+                  print(f"❌ Failed to upload {name}: {e}")
+
+          upload_asset("links.db", "links.db", "application/octet-stream")
+          upload_asset("links.txt", "links.txt", "text/plain")
+          EOF
+          python release_manager.py
 
       - name: Upload Snapshot to Internet Archive (Final)
         if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.ARCHIVE_FILENAME != ''
@@ -294,7 +260,9 @@ jobs:
           echo "💤 Սպասում ենք 30 վայրկյան..."
           sleep 30
           
-          # Այստեղ ստուգում և դիմում ենք հենց քո նշած awec-247.yml ֆայլի հերթին
+          # ՈՒՇԱԴՐՈՒԹՅՈՒՆ. Եթե քո workflow ֆայլի անունը (.github/workflows/-ի մեջ) տարբերվում է awec-247.yml-ից,
+          # ներքևի հղումների մեջ "awec-247.yml" փոխիր քո իրական ֆայլի անունով։
+          
           RUNS_COUNT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/runs?status=queued" \
             | jq '.total_count')
