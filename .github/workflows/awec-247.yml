@@ -3,18 +3,17 @@ name: AWEC Continuous Link Collector
 on:
   push:
     branches:
-      - main              # Հենց կոդը push անես, միանգամից ավտոմատ կսկսի աշխատել
+      - main
   schedule:
     - cron: '0 */5 * * *' # Ամեն 5 ժամը մեկ
-  workflow_dispatch:      # Ձեռքով միացնելու հնարավորություն
+  workflow_dispatch:      # Ձեռքով թողարկելու հնարավորություն
 
-# Ապահովում է, որ 2-րդը չի սկսի զուգահեռ, այլ կսպասի հերթում, որպեսզի տվյալները չխառնվեն
 concurrency:
   group: aw_crawler_group
   cancel-in-progress: false
 
 permissions:
-  contents: write         # Թույլտվություն՝ Release ստեղծելու և թարմացնելու համար
+  contents: write
 
 jobs:
   crawl:
@@ -66,11 +65,40 @@ jobs:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
         run: |
-          # Սարդը աշխատում է 5 ժամ (18000 վայրկյան)
+          echo "🚀 Սկսում ենք սարդի աշխատանքը 5 ժամով..."
+          # Ճիշտ 5 ժամ (18000 վայրկյան) աշխատանք
           timeout 18000 python collector_247.py || true
 
+      - name: Check and Repair SQLite Database
+        if: always() # Միշտ աշխատել՝ նույնիսկ Cancel-ի դեպքում
+        run: |
+          if [ -f "links.db" ]; then
+            echo "🛠️ Ստուգում ենք բազայի ամբողջականությունը..."
+            INTEGRITY=$(sqlite3 links.db "PRAGMA integrity_check;" 2>&1 || echo "error")
+            
+            if [ "$INTEGRITY" != "ok" ] || [[ "$INTEGRITY" == *"error"* ]] || [[ "$INTEGRITY" == *"malformed"* ]]; then
+              echo "⚠️ Բազան վնասված է (malformed): Սկսում ենք ավտոմատ վերականգնումը..."
+              mv links.db links_corrupted.db
+              # Վերականգնում ենք տվյալները նոր ֆայլի մեջ `.recover` հրամանով
+              sqlite3 links_corrupted.db ".recover" | sqlite3 links.db
+              
+              # Եթե վերականգնումը հաջողվեց, ջնջում ենք վնասվածը
+              if [ -f "links.db" ] && [ $(stat -c%s "links.db") -gt 0 ]; then
+                echo "🎉 Բազան հաջողությամբ վերականգնվեց։"
+                rm -f links_corrupted.db
+              else
+                echo "🚨 Վերականգնումը ձախողվեց։ Օգտագործում ենք նախորդ պահուստային տարբերակը..."
+                mv links_corrupted.db links.db
+              fi
+            else
+              echo "✅ Բազան առողջ է, վնասվածքներ չկան։"
+            fi
+          else
+            echo "ℹ️ links.db ֆայլ գոյություն չունի։"
+          fi
+
       - name: Export DB to Plain Text
-        if: always() # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
+        if: always()
         run: |
           python -c "
           import sqlite3
@@ -79,12 +107,17 @@ jobs:
               try:
                   conn = sqlite3.connect('links.db')
                   cursor = conn.cursor()
-                  cursor.execute('SELECT url FROM urls')
-                  urls = cursor.fetchall()
-                  with open('links.txt', 'w', encoding='utf-8') as f:
-                      for u in urls:
-                          f.write(u[0] + '\n')
-                  print(f'🎉 Successfully exported {len(urls)} links to links.txt')
+                  # Ստուգում ենք սեղանի գոյությունը, որպեսզի կոդը չկանգնի
+                  cursor.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='urls'\")
+                  if cursor.fetchone():
+                      cursor.execute('SELECT url FROM urls')
+                      urls = cursor.fetchall()
+                      with open('links.txt', 'w', encoding='utf-8') as f:
+                          for u in urls:
+                              f.write(u[0] + '\n')
+                      print(f'🎉 Successfully exported {len(urls)} links to links.txt')
+                  else:
+                      print('Table urls does not exist yet!')
                   conn.close()
               except Exception as e:
                   print('Export failed:', e)
@@ -93,25 +126,23 @@ jobs:
           "
 
       - name: Analyze DB State and Prepare File Names
-        if: always() # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
+        if: always()
         id: prep
         run: |
           if [ -f "links.db" ]; then
-            COUNT=$(sqlite3 links.db "SELECT COUNT(*) FROM urls")
-            FILE_SIZE=$(stat -c%s "links.db")
+            # Օգտագործում ենք -cmd կառուցվածքը սխալներից խուսափելու համար
+            COUNT=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo "0")
+            FILE_SIZE=$(stat -c%s "links.db" 2>/dev/null || echo "0")
           else
             COUNT=0
             FILE_SIZE=0
           fi
           
-          # 2GB սահմանափակման ստուգում
           LIMIT_2GB=2147483648
           if [ $FILE_SIZE -ge $LIMIT_2GB ]; then
             echo "🚨 FILE REACHED 2GB LIMIT!"
-            echo "REACHED_2GB=true" >> $GITHUB_OUTPUT
             TAG_NAME="v-chunk-$(date -d '+4 hours' +'%Y%m%d_%H%M%S')"
           else
-            echo "REACHED_2GB=false" >> $GITHUB_OUTPUT
             TAG_NAME="latest-state"
           fi
           
@@ -120,93 +151,83 @@ jobs:
           echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_OUTPUT
           echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
           
-          if [ -f "links.db" ]; then
+          if [ -f "links.db" ] && [ "$COUNT" -ne "0" ]; then
             cp links.db "${TIMESTAMP}_links_${COUNT}.db"
             echo "ARCHIVE_FILENAME=${TIMESTAMP}_links_${COUNT}.db" >> $GITHUB_OUTPUT
+          else
+            echo "ARCHIVE_FILENAME=" >> $GITHUB_OUTPUT
           fi
 
-      - name: Handle GitHub Release and Upload Assets with Real-Time Progress
-        if: always() && steps.prep.outputs.COUNT != '0' # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
+      - name: Handle GitHub Release and Upload Assets
+        if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.COUNT != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.prep.outputs.TAG_NAME }}
         run: |
           echo "📁 Ֆայլերի չափսերը ստուգում:"
-          ls -lh links.db links.txt
+          ls -lh links.db links.txt || true
           
           echo "🔄 Ստեղծում/թարմացնում ենք GitHub Release-ը..."
-          # 1. Ստեղծում ենք Release կամ թարմացնում գոյություն ունեցողը API-ով
           RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG | jq -r '.id')
           
           if [ "$RELEASE_ID" == "null" ] || [ -z "$RELEASE_ID" ]; then
-            # Եթե չկա, սարքում ենք նորը
             RELEASE_ID=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
               -d "{\"tag_name\":\"$TAG\",\"name\":\"AWEC State $TAG\",\"body\":\"Links count: ${{ steps.prep.outputs.COUNT }}\"}" \
               https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.id')
           fi
           
-          # 2. Ջնջում ենք հին ֆայլերը Release-ի միջից, որ նորերը overwrite լինեն
           ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets)
           for asset_id in $(echo "$ASSETS" | jq -r '.[] | .id'); do
             curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id
           done
           
-          # 3. ՌԵԱԼ ԹԱՅՄ ՎԵՐԲԵՌՆՈՒՄ (Real-Time progress curl-ով)
-          echo "⬆️ Uploading links.db to GitHub Releases (Real-time progress):"
+          echo "⬆️ Uploading links.db to GitHub Releases:"
           curl -# -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Content-Type: application/octet-stream" \
             --data-binary @links.db \
             "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.db"
           
-          echo -e "\n⬆️ Uploading links.txt to GitHub Releases (Real-time progress):"
+          echo -e "\n⬆️ Uploading links.txt to GitHub Releases:"
           curl -# -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Content-Type: text/plain" \
             --data-binary @links.txt \
             "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.txt"
-          echo -e "\n✅ GitHub Release-ի վերբեռնումը ավարտվեց։"
 
       - name: Upload Snapshot to Internet Archive
-        if: always() && steps.prep.outputs.COUNT != '0' # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
+        if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.ARCHIVE_FILENAME != ''
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
         run: |
           FILENAME="${{ steps.prep.outputs.ARCHIVE_FILENAME }}"
           echo "📤 Sending snapshot to Archive.org: $FILENAME"
-          
-          # 1. Ստեղծում ենք կոնֆիգուրացիայի թղթապանակը վիրտուալ մեքենայի ներսում
           mkdir -p ~/.config
-          
-          # 2. Գրում ենք քո Repository Secrets-ի արժեքները կոնֆիգ ֆայլի մեջ
           cat <<EOF > ~/.config/ia.ini
           [s3]
           access = $IA_ACCESS_KEY
           secret = $IA_SECRET_KEY
           EOF
           
-          # 3. Վերբեռնում ենք ֆայլը
           ia upload awec_links_awe_o.s "$FILENAME" \
             --metadata="title:AWEC Harvest $FILENAME" \
             --metadata="mediatype:data" \
             --metadata="collection:opensource"
 
       - name: Wait 30s and Trigger Next Loop Automatically
-        if: always() # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
+        if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "💤 Սպասում ենք 30 վայրկյան հանգստանալու համար..."
           sleep 30
           
-          # 1. Ստուգում ենք, թե արդյոք արդեն կա հերթում սպասող (queued/in_progress) այլ աշխատանք
           RUNS_COUNT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/crawler.yml/runs?status=queued" \
             | jq '.total_count')
           
-          # 2. Եթե հերթում սպասող չկա, նոր կանչ ենք անում
           if [ "$RUNS_COUNT" -eq 0 ] || [ -z "$RUNS_COUNT" ]; then
             echo "🔄 Հերթում սպասող աշխատանք չկա։ Կանչում ենք հաջորդ ցիկլը..."
             curl -X POST \
