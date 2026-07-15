@@ -33,71 +33,149 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y sqlite3 jq curl
+          sudo apt-get install -y sqlite3 jq curl pv
 
       - name: Install Python Requirements
         run: |
           pip install --upgrade pip
-          pip install aiohttp internetarchive
+          pip install aiohttp internetarchive beauty-soup-4 requests || true
 
-      - name: Download Last DB from GitHub Releases
+      - name: Download Last DB with Progress (%)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "🔄 Փնտրում ենք վերջին տվյալների բազան..."
           RELEASE_DATA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            https://api.github.com/repos/${{ github.repository }}/releases/tags/latest-state || true)
+            https://api.github.com/repos/${{ github.repository }}/releases/latest || true)
           
           DOWNLOAD_URL=$(echo "$RELEASE_DATA" | jq -r '.assets[] | select(.name=="links.db") | .url' 2>/dev/null || echo "")
           
           if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
-            echo "📥 Գտնվեց նախորդ աշխատանքային բազան։ Ներբեռնում ենք..."
+            echo "📥 Գտնվեց նախորդ բազան։ Ներբեռնում ենք..."
+            # Օգտագործում ենք pv կամ curl-ի ստանդարտ առաջընթացի տողը %-ով ցույց տալու համար
             curl -L -H "Authorization: token $GITHUB_TOKEN" \
                  -H "Accept: application/octet-stream" \
-                 -o links.db "$DOWNLOAD_URL"
-            echo "✅ Բազան հաջողությամբ ներբեռնված է։"
+                 -o links.db "$DOWNLOAD_URL" --progress-bar
+            echo "✅ Ներբեռնումն ավարտվեց։"
           else
-            echo "ℹ️ Նախորդ բազա չգտնվեց։ Ստեղծվում է նոր links.db..."
+            echo "ℹ️ Նախորդ բազա չգտնվեց։ Կստեղծվի նորը..."
           fi
 
-      - name: Run AWEC Planetary Crawler
-        env:
-          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
-          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
-        run: |
-          echo "🚀 Սկսում ենք սարդի աշխատանքը 5 ժամով..."
-          # Ճիշտ 5 ժամ (18000 վայրկյան) աշխատանք
-          timeout 18000 python collector_247.py || true
-
-      - name: Check and Repair SQLite Database
-        if: always() # Միշտ աշխատել՝ նույնիսկ Cancel-ի դեպքում
+      - name: Check and Repair SQLite Database with Status (%)
         run: |
           if [ -f "links.db" ]; then
             echo "🛠️ Ստուգում ենք բազայի ամբողջականությունը..."
             INTEGRITY=$(sqlite3 links.db "PRAGMA integrity_check;" 2>&1 || echo "error")
             
             if [ "$INTEGRITY" != "ok" ] || [[ "$INTEGRITY" == *"error"* ]] || [[ "$INTEGRITY" == *"malformed"* ]]; then
-              echo "⚠️ Բազան վնասված է (malformed): Սկսում ենք ավտոմատ վերականգնումը..."
+              echo "⚠️ Բազան վնասված է։ Սկսում ենք բուժման գործընթացը..."
+              
+              # Հաշվում ենք հին տողերի քանակը (եթե հնարավոր է կարդալ)
+              OLD_ROWS=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo "0")
+              
               mv links.db links_corrupted.db
-              # Վերականգնում ենք տվյալները նոր ֆայլի մեջ `.recover` հրամանով
               sqlite3 links_corrupted.db ".recover" | sqlite3 links.db
               
-              # Եթե վերականգնումը հաջողվեց, ջնջում ենք վնասվածը
-              if [ -f "links.db" ] && [ $(stat -c%s "links.db") -gt 0 ]; then
-                echo "🎉 Բազան հաջողությամբ վերականգնվեց։"
+              if [ -f "links.db" ]; then
+                NEW_ROWS=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo "0")
+                
+                if [ "$OLD_ROWS" -gt 0 ]; then
+                  RECOVERY_RATE=$(( (NEW_ROWS * 100) / OLD_ROWS ))
+                else
+                  RECOVERY_RATE=100
+                fi
+                echo "🎉 Բուժումն ավարտվեց։ Վերականգնվել է տվյալների $RECOVERY_RATE% -ը ($NEW_ROWS / $OLD_ROWS հղում)։"
                 rm -f links_corrupted.db
               else
-                echo "🚨 Վերականգնումը ձախողվեց։ Օգտագործում ենք նախորդ պահուստային տարբերակը..."
-                mv links_corrupted.db links.db
+                echo "🚨 Բուժումը ձախողվեց։ Ստեղծվում է դատարկ բազա..."
+                rm -f links_corrupted.db
               fi
             else
-              echo "✅ Բազան առողջ է, վնասվածքներ չկան։"
+              echo "✅ Բազան 100% առողջ է, բուժման կարիք չկա։"
             fi
-          else
-            echo "ℹ️ links.db ֆայլ գոյություն չունի։"
           fi
 
-      - name: Export DB to Plain Text
+      - name: Run AWEC Planetary Crawler (5h Limit & 1.99GB Auto-Release)
+        env:
+          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "🚀 Սկսում ենք սարդի աշխատանքը..."
+          
+          # Բացում ենք WAL ռեժիմը բազայի համար՝ արագության և անվտանգության համար
+          if [ -f "links.db" ]; then
+            sqlite3 links.db "PRAGMA journal_mode=WAL;" || true
+          fi
+
+          # Այս Python կոդը կաշխատեցնի քո collector_247.py-ը և զուգահեռ կհետևի ֆայլի չափսին։
+          # Եթե ֆայլը դառնա 1.99 ԳԲ, այն ավտոմատ կդադարեցնի սարդը, կանի Release ու կշարունակի։
+          python -c "
+          import subprocess
+          import os
+          import time
+          import sys
+
+          start_time = time.time()
+          five_hours = 18000 # 5 ժամ վայրկյաններով
+          limit_bytes = 2136746229 # 1.99 GB բայթերով
+
+          while True:
+              remaining_time = int(five_hours - (time.time() - start_time))
+              if remaining_time <= 0:
+                  print('⏰ 5 ժամը լրացավ։ Ավարտում ենք աշխատանքը։')
+                  break
+              
+              print(f'🕷️ Միացնում ենք սարդը {remaining_time} վայրկյանով...')
+              
+              # Աշխատեցնում ենք սարդը որպես ենթապրոցես
+              process = subprocess.Popen([sys.executable, 'collector_247.py'])
+              
+              # Հետևում ենք ֆայլի չափսին ամեն 10 վայրկյանը մեկ
+              reached_limit = False
+              while process.poll() is None:
+                  time.sleep(10)
+                  if os.path.exists('links.db'):
+                      size = os.path.getsize('links.db')
+                      if size >= limit_bytes:
+                          print('🚨 Ֆայլի չափսը հասավ 1.99 ԳԲ-ի սահմանին։ Կանգնեցնում ենք սարդը...')
+                          process.terminate()
+                          process.wait()
+                          reached_limit = True
+                          break
+                  
+                  # Եթե ընդհանուր 5 ժամ ժամանակը սպառվեց
+                  if (time.time() - start_time) >= five_hours:
+                      print('⏰ 5 ժամը լրացավ։ Կանգնեցնում ենք պրոցեսը...')
+                      process.terminate()
+                      process.wait()
+                      break
+              
+              if reached_limit:
+                  print('📦 Սկսում ենք միջանկյալ 1.99 ԳԲ Release-ի պատրաստումը...')
+                  # Փակում ենք WAL-ը, որպեսզի ֆայլը ճիշտ պահպանվի
+                  os.system('sqlite3 links.db \"PRAGMA journal_mode=DELETE;\"')
+                  
+                  # Կատարում ենք արտահանում տեքստային տարբերակի
+                  os.system('python -c \"import sqlite3, os; conn=sqlite3.connect(\'links.db\'); cur=conn.cursor(); cur.execute(\'SELECT url FROM urls\'); urls=cur.fetchall(); f=open(\'links.txt\', \'w\', encoding=\'utf-8\'); [f.write(u[0]+\'\\n\') for u in urls]; f.close(); conn.close()\"')
+                  
+                  # Ստեղծում ենք միջանկյալ Release GitHub-ում
+                  timestamp = time.strftime('%Y%m%d_%H%M%S')
+                  tag = f'v-chunk-{timestamp}'
+                  os.system(f'curl -s -X POST -H \"Authorization: token {os.environ[\"GITHUB_TOKEN\"]}\" -d \"{{\\\"tag_name\\\":\\\"{tag}\\\",\\\"name\\\":\\\"AWEC Split {tag}\\\",\\\"body\\\":\\\"Automated split at 1.99GB limit.\\\"}}\" https://api.github.com/repos/{os.environ[\"GITHUB_REPOSITORY\"]}/releases')
+                  
+                  # Ջնջում ենք հին բազան, որ նորից 0-ից սկսի ու 2 ԳԲ-ի սահմանը չանցնի
+                  if os.path.exists('links.db'):
+                      os.remove('links.db')
+                  if os.path.exists('links.txt'):
+                      os.remove('links.txt')
+                  print('✅ Միջանկյալ Release-ը պատրաստ է։ Շարունակում ենք հաջորդ մասի crawl-ը...')
+              else:
+                  # Եթե պրոցեսն ինքն իրեն ավարտվեց կամ ժամանակը սպառվեց
+                  break
+          "
+
+      - name: Export DB to Plain Text (Final)
         if: always()
         run: |
           python -c "
@@ -107,7 +185,6 @@ jobs:
               try:
                   conn = sqlite3.connect('links.db')
                   cursor = conn.cursor()
-                  # Ստուգում ենք սեղանի գոյությունը, որպեսզի կոդը չկանգնի
                   cursor.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='urls'\")
                   if cursor.fetchone():
                       cursor.execute('SELECT url FROM urls')
@@ -115,95 +192,73 @@ jobs:
                       with open('links.txt', 'w', encoding='utf-8') as f:
                           for u in urls:
                               f.write(u[0] + '\n')
-                      print(f'🎉 Successfully exported {len(urls)} links to links.txt')
+                      print(f'🎉 Exported {len(urls)} links.')
                   else:
-                      print('Table urls does not exist yet!')
+                      print('Table urls does not exist!')
                   conn.close()
               except Exception as e:
                   print('Export failed:', e)
           else:
-              print('links.db not found for export!')
+              print('links.db not found!')
           "
 
-      - name: Analyze DB State and Prepare File Names
+      - name: Prepare Unique Release Tag and Filename (Final)
         if: always()
         id: prep
         run: |
           if [ -f "links.db" ]; then
-            # Օգտագործում ենք -cmd կառուցվածքը սխալներից խուսափելու համար
             COUNT=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo "0")
-            FILE_SIZE=$(stat -c%s "links.db" 2>/dev/null || echo "0")
           else
             COUNT=0
-            FILE_SIZE=0
-          fi
-          
-          LIMIT_2GB=2147483648
-          if [ $FILE_SIZE -ge $LIMIT_2GB ]; then
-            echo "🚨 FILE REACHED 2GB LIMIT!"
-            TAG_NAME="v-chunk-$(date -d '+4 hours' +'%Y%m%d_%H%M%S')"
-          else
-            TAG_NAME="latest-state"
           fi
           
           TIMESTAMP=$(date -d '+4 hours' +'%Y%m%d_%H%M%S')
-          echo "COUNT=$COUNT" >> $GITHUB_OUTPUT
-          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_OUTPUT
-          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          TAG_NAME="v-${TIMESTAMP}"
+          ARCHIVE_FILENAME="${TIMESTAMP}_links_${COUNT}.db"
           
-          if [ -f "links.db" ] && [ "$COUNT" -ne "0" ]; then
-            cp links.db "${TIMESTAMP}_links_${COUNT}.db"
-            echo "ARCHIVE_FILENAME=${TIMESTAMP}_links_${COUNT}.db" >> $GITHUB_OUTPUT
-          else
-            echo "ARCHIVE_FILENAME=" >> $GITHUB_OUTPUT
+          echo "COUNT=$COUNT" >> $GITHUB_OUTPUT
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_OUTPUT
+          echo "ARCHIVE_FILENAME=$ARCHIVE_FILENAME" >> $GITHUB_OUTPUT
+          
+          if [ -f "links.db" ]; then
+            cp links.db "$ARCHIVE_FILENAME"
           fi
 
-      - name: Handle GitHub Release and Upload Assets
+      - name: Create New GitHub Release and Upload Unique Assets (Final)
         if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.COUNT != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.prep.outputs.TAG_NAME }}
         run: |
-          echo "📁 Ֆայլերի չափսերը ստուգում:"
-          ls -lh links.db links.txt || true
+          echo "🔄 Ստեղծում ենք վերջնական GitHub Release..."
           
-          echo "🔄 Ստեղծում/թարմացնում ենք GitHub Release-ը..."
-          RELEASE_ID=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG | jq -r '.id')
+          RELEASE_ID=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"AWEC Run $TAG\",\"body\":\"Successfully collected ${{ steps.prep.outputs.COUNT }} links.\",\"draft\":false,\"prerelease\":false}" \
+            https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.id')
           
-          if [ "$RELEASE_ID" == "null" ] || [ -z "$RELEASE_ID" ]; then
-            RELEASE_ID=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
-              -d "{\"tag_name\":\"$TAG\",\"name\":\"AWEC State $TAG\",\"body\":\"Links count: ${{ steps.prep.outputs.COUNT }}\"}" \
-              https://api.github.com/repos/${{ github.repository }}/releases | jq -r '.id')
+          if [ "$RELEASE_ID" != "null" ] && [ -n "$RELEASE_ID" ]; then
+            curl -# -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @links.db \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.db"
+            
+            curl -# -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: text/plain" \
+              --data-binary @links.txt \
+              "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.txt"
           fi
-          
-          ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets)
-          for asset_id in $(echo "$ASSETS" | jq -r '.[] | .id'); do
-            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id
-          done
-          
-          echo "⬆️ Uploading links.db to GitHub Releases:"
-          curl -# -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Content-Type: application/octet-stream" \
-            --data-binary @links.db \
-            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.db"
-          
-          echo -e "\n⬆️ Uploading links.txt to GitHub Releases:"
-          curl -# -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Content-Type: text/plain" \
-            --data-binary @links.txt \
-            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=links.txt"
 
-      - name: Upload Snapshot to Internet Archive
+      - name: Upload Snapshot to Internet Archive (Final)
         if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.ARCHIVE_FILENAME != ''
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
         run: |
           FILENAME="${{ steps.prep.outputs.ARCHIVE_FILENAME }}"
-          echo "📤 Sending snapshot to Archive.org: $FILENAME"
+          echo "📤 Ուղարկում ենք Internet Archive: $FILENAME"
           mkdir -p ~/.config
           cat <<EOF > ~/.config/ia.ini
           [s3]
@@ -221,7 +276,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "💤 Սպասում ենք 30 վայրկյան հանգստանալու համար..."
+          echo "💤 Սպասում ենք 30 վայրկյան..."
           sleep 30
           
           RUNS_COUNT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
@@ -229,12 +284,12 @@ jobs:
             | jq '.total_count')
           
           if [ "$RUNS_COUNT" -eq 0 ] || [ -z "$RUNS_COUNT" ]; then
-            echo "🔄 Հերթում սպասող աշխատանք չկա։ Կանչում ենք հաջորդ ցիկլը..."
+            echo "🔄 Կանչում ենք հաջորդ ցիկլը..."
             curl -X POST \
               -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/${{ github.repository }}/actions/workflows/crawler.yml/dispatches \
               -d '{"ref":"main"}'
           else
-            echo "ℹ️ Հերթում արդեն կա սպասող աշխատանք։ Ավելորդ կանչ չենք անում։"
+            echo "ℹ️ Հերթում արդեն կա սպասող աշխատանք։"
           fi
