@@ -8,6 +8,11 @@ on:
     - cron: '0 */6 * * *' # Ամեն 6 ժամը մեկ
   workflow_dispatch:      # Ձեռքով միացնելու հնարավորություն
 
+# Ապահովում է, որ 2-րդը չի սկսի զուգահեռ, այլ կսպասի հերթում, որպեսզի տվյալները չխառնվեն
+concurrency:
+  group: aw_crawler_group
+  cancel-in-progress: false
+
 permissions:
   contents: write         # Թույլտվություն՝ Release ստեղծելու և թարմացնելու համար
 
@@ -65,7 +70,7 @@ jobs:
           timeout 18000 python collector_247.py || true
 
       - name: Export DB to Plain Text
-        if: always()
+        if: always() # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
         run: |
           python -c "
           import sqlite3
@@ -88,7 +93,7 @@ jobs:
           "
 
       - name: Analyze DB State and Prepare File Names
-        if: always()
+        if: always() # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
         id: prep
         run: |
           if [ -f "links.db" ]; then
@@ -121,7 +126,7 @@ jobs:
           fi
 
       - name: Handle GitHub Release and Upload Assets with Real-Time Progress
-        if: always() && steps.prep.outputs.COUNT != '0'
+        if: always() && steps.prep.outputs.COUNT != '0' # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.prep.outputs.TAG_NAME }}
@@ -164,7 +169,7 @@ jobs:
           echo -e "\n✅ GitHub Release-ի վերբեռնումը ավարտվեց։"
 
       - name: Upload Snapshot to Internet Archive
-        if: always() && steps.prep.outputs.COUNT != '0'
+        if: always() && steps.prep.outputs.COUNT != '0' # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
@@ -188,14 +193,27 @@ jobs:
             --metadata="mediatype:data" \
             --metadata="collection:opensource"
 
-      - name: Trigger Next Loop Automatically
-        if: always()
+      - name: Wait 30s and Trigger Next Loop Automatically
+        if: always() # Սա կաշխատի միշտ՝ նույնիսկ եթե ձեռքով Cancel ես արել
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔄 Կանչում ենք հաջորդ ցիկլը..."
-          curl -X POST \
-            -H "Authorization: token $GITHUB_TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/crawler.yml/dispatches \
-            -d '{"ref":"main"}'
+          echo "💤 Սպասում ենք 30 վայրկյան հանգստանալու համար..."
+          sleep 30
+          
+          # 1. Ստուգում ենք, թե արդյոք արդեն կա հերթում սպասող (queued/in_progress) այլ աշխատանք
+          RUNS_COUNT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/crawler.yml/runs?status=queued" \
+            | jq '.total_count')
+          
+          # 2. Եթե հերթում սպասող չկա, նոր կանչ ենք անում
+          if [ "$RUNS_COUNT" -eq 0 ] || [ -z "$RUNS_COUNT" ]; then
+            echo "🔄 Հերթում սպասող աշխատանք չկա։ Կանչում ենք հաջորդ ցիկլը..."
+            curl -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/crawler.yml/dispatches \
+              -d '{"ref":"main"}'
+          else
+            echo "ℹ️ Հերթում արդեն կա սպասող աշխատանք։ Ավելորդ կանչ չենք անում։"
+          fi
