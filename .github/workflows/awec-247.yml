@@ -1,3 +1,8 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  AWEC – Matrix Spiders + Deduplicator + Dual Uploaders
+#  10 spider + 1 dedup-checker + 2 uploader = 13 jobs
+#  Zero data loss, zero duplicates, ultra-fast
+# ═══════════════════════════════════════════════════════════════════
 name: AWEC – 13-Job Matrix Spiders
 
 on:
@@ -32,11 +37,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.10' }
+        with:
+          python-version: '3.10'
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2
 
       - name: Download latest release shards
-        env: { GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         run: |
           mkdir -p prev_release
           ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
@@ -55,7 +62,9 @@ jobs:
         id: dl_checkpoints
         continue-on-error: true
         uses: actions/download-artifact@v4
-        with: { pattern: checkpoint-shard-*, path: recovery_checkpoints }
+        with:
+          pattern: 'checkpoint-shard-*'
+          path: recovery_checkpoints
 
       - name: Merge all sources into one links.db
         run: |
@@ -115,7 +124,10 @@ jobs:
           PYEOF
 
       - uses: actions/upload-artifact@v4
-        with: { name: all-initial-shards, path: initial_shards/initial_shard_*.db, retention-days: 1 }
+        with:
+          name: all-initial-shards
+          path: initial_shards/initial_shard_*.db
+          retention-days: 1
 
       - name: Set outputs
         id: prep
@@ -138,11 +150,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.10', cache: 'pip' }
+        with:
+          python-version: '3.10'
+          cache: 'pip'
       - run: pip install -q aiohttp pigz
 
       - uses: actions/download-artifact@v4
-        with: { name: all-initial-shards, path: initial_shards }
+        with:
+          name: all-initial-shards
+          path: initial_shards
 
       - name: Find my shard DB
         id: find_db
@@ -154,11 +170,13 @@ jobs:
             exit 1
           fi
           echo "DB_FILE=$FILE" >> $GITHUB_OUTPUT
-- name: Download spider outputs
+
+      - name: Restore checkpoint if exists
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          pattern: spider-output-shard-*
-          path: all_spiders
+          name: checkpoint-shard-${{ matrix.shard }}
+          path: .
 
       - name: Extract checkpoint
         run: |
@@ -204,7 +222,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         if: always() && steps.save_ckpt.outputs.CHECKPOINT_READY == 'true'
-        with: { name: checkpoint-shard-${{ matrix.shard }}, path: checkpoint.tar.gz, retention-days: 1 }
+        with:
+          name: checkpoint-shard-${{ matrix.shard }}
+          path: checkpoint.tar.gz
+          retention-days: 1
 
       - name: 📦 Prepare spider output (raw DB + txt)
         if: always()
@@ -213,24 +234,29 @@ jobs:
           SHARD_INDEX: ${{ matrix.shard }}
         run: |
           mkdir -p output
-          python3 -c "
-          import sqlite3
-          conn = sqlite3.connect('$DB_FILE')
+          python3 << 'PYEOF'
+          import sqlite3, os
+          db_file = os.environ['DB_FILE']
+          shard_index = os.environ['SHARD_INDEX']
+          conn = sqlite3.connect(db_file)
           c = conn.cursor()
           c.execute('SELECT url FROM urls')
-          with open('output/links_$SHARD_INDEX.txt', 'w') as f:
+          with open(f'output/links_{shard_index}.txt', 'w') as f:
               while True:
                   rows = c.fetchmany(50000)
                   if not rows: break
                   f.writelines(row[0] + '\n' for row in rows)
           conn.close()
-          "
+          PYEOF
           cp "$DB_FILE" output/spider_$SHARD_INDEX.db
           tar -I pigz -cf spider-output.tar.gz -C output .
 
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: spider-output-shard-${{ matrix.shard }}, path: spider-output.tar.gz, retention-days: 1 }
+        with:
+          name: spider-output-shard-${{ matrix.shard }}
+          path: spider-output.tar.gz
+          retention-days: 1
 
 
   # ═══════════════════════════════════════════════════════════════════
@@ -245,20 +271,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: '3.10' }
+        with:
+          python-version: '3.10'
 
       - uses: actions/download-artifact@v4
-        with: { pattern: spider-output-shard-*, path: all_spiders }
+        with:
+          pattern: 'spider-output-shard-*'
+          path: all_spiders
 
       - name: Merge and Deduplicate all spider DBs
         run: |
-          python3 -c "
+          python3 << 'PYEOF'
           import glob, tarfile, os
-          for f in glob.glob(\"all_spiders/**/*.tar.gz\", recursive=True):
-              print(f\"Extracting {f}...\")
-              with tarfile.open(f, \"r\") as tar:
-                  tar.extractall(path=\"extracted_spiders\")
-          "
+          for f in glob.glob("all_spiders/**/*.tar.gz", recursive=True):
+              print(f"Extracting {f}...")
+              with tarfile.open(f, "r") as tar:
+                  tar.extractall(path="extracted_spiders")
+          PYEOF
 
           python3 << 'PYEOF'
           import sqlite3, os, glob
@@ -337,7 +366,10 @@ jobs:
           tar -I pigz -cf dedup-output.tar.gz final_shards links.txt
 
       - uses: actions/upload-artifact@v4
-        with: { name: dedup-output, path: dedup-output.tar.gz, retention-days: 1 }
+        with:
+          name: dedup-output
+          path: dedup-output.tar.gz
+          retention-days: 1
 
 
   # ═══════════════════════════════════════════════════════════════════
@@ -350,13 +382,17 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/download-artifact@v4
-        with: { name: dedup-output, path: . }
+        with:
+          name: dedup-output
+          path: .
 
       - name: Extract
         run: tar -I pigz -xf dedup-output.tar.gz
 
       - name: 🚀 Create GitHub Release & Upload
-        env: { GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}', TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}' }
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
         run: |
           echo "$GITHUB_TOKEN" | gh auth login --with-token
           TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
@@ -386,7 +422,9 @@ jobs:
     timeout-minutes: 360
     steps:
       - uses: actions/download-artifact@v4
-        with: { name: dedup-output, path: . }
+        with:
+          name: dedup-output
+          path: .
 
       - name: Extract
         run: tar -I pigz -xf dedup-output.tar.gz
