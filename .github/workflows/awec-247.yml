@@ -18,7 +18,7 @@ permissions:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 320 # Ընդհանուր ժամանակը 5 ժամից մի փոքր ավելի
+    timeout-minutes: 320
     outputs:
       COUNT: ${{ steps.prep.outputs.COUNT }}
       TAG_NAME: ${{ steps.prep.outputs.TAG_NAME }}
@@ -70,7 +70,7 @@ jobs:
         run: |
           if [ -f "links.db" ]; then
             echo "🛠️ Ստուգում ենք բազայի ամբողջականությունը..."
-            INTEGRITY=$(sqlite3 links.db "PRAGMA integrity_check;" 2>&1 || echo "error")
+            INTEGRITY=$(sqlite3 integrity_check "PRAGMA integrity_check;" 2>&1 || echo "error")
             
             if [ "$INTEGRITY" != "ok" ] || [[ "$INTEGRITY" == *"error"* ]] || [[ "$INTEGRITY" == *"malformed"* ]]; then
               echo "⚠️ Բազան վնասված է։ Սկսում ենք բուժման գործընթացը..."
@@ -99,21 +99,54 @@ jobs:
             fi
           fi
 
-      - name: Run AWEC Planetary Crawler (5 Hours / 2GB Size Limit)
+      - name: Run AWEC Planetary Crawler with Hot-Release on 2GB Limit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           echo "🚀 Սկսում ենք սարդի աշխատանքը..."
           
-          # Միացնում ենք քո սարդը ֆոնային ռեժիմով (background)
+          # Միացնում ենք սարդը ֆոնային ռեժիմով
           python collector_247.py &
           SPIDER_PID=$!
           
-          echo "🕷️ Սարդը միացավ PID $SPIDER_PID-ով։ Սկսում ենք մոնիտորինգը..."
+          echo "🕷️ Սարդը միացավ PID $SPIDER_PID-ով։ Սկսում ենք ակտիվ մոնիտորինգը..."
           
-          MAX_TIME=18000  # 5 ժամ (վայրկյաններով)
-          MAX_SIZE=2093796556 # ~1.95 ԳԲ (որպեսզի 2 ԳԲ-ի սահմանը հաստատ չանցնի)
+          MAX_TIME=18000      # 5 ժամ
+          MAX_SIZE=2093796556 # ~1.95 ԳԲ
           ELAPSED=0
-          INTERVAL=15 # Ստուգել 15 վայրկյանը մեկ
+          INTERVAL=15
+          PART_NUM=1          # Ինդեքս, եթե 5 ժամում մի քանի հատ 2ԳԲ-անոց ֆայլ ստացվի
           
+          # Պատրաստում ենք Python սկրիպտ՝ արագ Release սարքելու և վերբեռնելու համար
+          cat << 'EOF' > hot_release.py
+          import os, json, sys, urllib.request
+          token = os.environ.get('GITHUB_TOKEN')
+          repo = os.environ.get('REPOSITORY')
+          filepath = sys.argv[1]
+          tag = sys.argv[2]
+          
+          # Ստեղծում ենք միջանկյալ Release
+          headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"}
+          data = {"tag_name": tag, "name": f"AWEC Hot-Release {tag}", "body": "Intermediate 2GB Database Snapshot.", "draft": False, "prerelease": False}
+          
+          try:
+              req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases", data=json.dumps(data).encode('utf-8'), headers=headers, method="POST")
+              with urllib.request.urlopen(req) as r:
+                  release_id = json.loads(r.read().decode()).get('id')
+              
+              # Վերբեռնում ենք 2ԳԲ-անոց ֆայլը
+              upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={filepath}"
+              headers_upload = {"Authorization": f"token {token}", "Content-Type": "application/octet-stream"}
+              with open(filepath, "rb") as f:
+                  file_data = f.read()
+              req_upload = urllib.request.Request(upload_url, data=file_data, headers=headers_upload, method="POST")
+              with urllib.request.urlopen(req_upload) as resp:
+                  print(f"✅ Hot-Uploaded {filepath} successfully.")
+          except Exception as e:
+              print(f"❌ Hot-Upload failed: {e}")
+          EOF
+
           while [ $ELAPSED -lt $MAX_TIME ]; do
             if ! kill -0 $SPIDER_PID 2>/dev/null; then
               echo "ℹ️ Սարդն ինքնուրույն ավարտեց աշխատանքը։"
@@ -123,8 +156,23 @@ jobs:
             if [ -f "links.db" ]; then
               SIZE=$(stat -c%s "links.db" 2>/dev/null || stat -f%z "links.db" 2>/dev/null || echo 0)
               if [ "$SIZE" -ge "$MAX_SIZE" ]; then
-                echo "🚨 ԶԳՈՒՇԱՑՈՒՄ: Տվյալների բազան հասել է $(($SIZE / 1024 / 1024)) ՄԲ-ի (մոտենում է 2 ԳԲ սահմանին)։ Կանգնեցնում ենք աշխատանքը..."
-                break
+                echo "⚠️ Բազայի չափը հասավ 2 ԳԲ-ի։ Սկսում ենք Hot-Release գործընթացը..."
+                
+                TIMESTAMP_HOT=$(date -d '+4 hours' +'%Y%m%d_%H%M%S')
+                HOT_TAG="v-hot-${TIMESTAMP_HOT}-part${PART_NUM}"
+                HOT_FILENAME="links_part${PART_NUM}_${TIMESTAMP_HOT}.db"
+                
+                # Պատճենում ենք ֆայլը, որպեսզի սարդի աշխատանքին չխանգարենք
+                cp links.db "$HOT_FILENAME"
+                
+                # Դատարկում ենք ակտիվ links.db-ն, որ սարդը շարունակի գրել զրոյից
+                sqlite3 links.db "VACUUM;" 2>/dev/null || true
+                > links.db 
+                
+                # Ֆոնային ռեժիմով ուղարկում ենք GitHub Release (որպեսզի սարդի աշխատանքը չկանգնի սպասելուց)
+                python hot_release.py "$HOT_FILENAME" "$HOT_TAG" &
+                
+                PART_NUM=$((PART_NUM + 1))
               fi
             fi
             
@@ -132,8 +180,7 @@ jobs:
             ELAPSED=$((ELAPSED + INTERVAL))
           done
           
-          echo "⏰ Ժամանակը կամ ծավալը սպառվեց։ Կանգնեցնում ենք սարդին..."
-          # Ուղարկում ենք SIGINT (Ctrl+C) անվտանգ կանգնեցման համար
+          echo "⏰ 5 ժամը լրացավ։ Կանգնեցնում ենք սարդին..."
           kill -2 $SPIDER_PID
           wait $SPIDER_PID || true
           echo "✅ Սարդը հաջողությամբ կանգնեցվեց։"
@@ -189,7 +236,7 @@ jobs:
             cp links.db "$ARCHIVE_FILENAME"
           fi
 
-      - name: Save Artifacts for Uploaders (Hard Drive, not RAM)
+      - name: Save Artifacts for Uploaders (Hard Drive)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -226,7 +273,6 @@ jobs:
   upload_github:
     needs: crawl
     runs-on: ubuntu-latest
-    # Աշխատում է միշտ (նույնիսկ եթե crawl-ը cancel է եղել), եթե կան հավաքված տվյալներ
     if: always() && needs.crawl.outputs.COUNT != '0' && needs.crawl.outputs.COUNT != ''
     timeout-minutes: 50
     steps:
@@ -253,7 +299,6 @@ jobs:
           tag = os.environ.get('TAG')
           count = os.environ.get('COUNT')
 
-          # 1. Ստեղծում ենք Release
           release_url = f"https://api.github.com/repos/{repo}/releases"
           headers = {
               "Authorization": f"token {token}",
@@ -278,7 +323,6 @@ jobs:
               print(f"❌ Error creating release: {e}")
               exit(1)
 
-          # 2. Վերբեռնում ենք ֆայլերը (links.db և links.txt)
           def upload_asset(filepath, name, content_type):
               if not os.path.exists(filepath):
                   print(f"⚠️ File {filepath} not found.")
@@ -291,7 +335,7 @@ jobs:
               try:
                   with open(filepath, "rb") as f:
                       file_data = f.read()
-                  req_upload = urllib.request.Request(upload_url, data=file_data, headers=headers_upload, method="POST")
+                  req_upload = urllib.request.Request(upload_url, data=file_data, headers_upload, method="POST")
                   with urllib.request.urlopen(req_upload) as resp:
                       print(f"✅ Uploaded {name} successfully.")
               except Exception as e:
@@ -305,7 +349,6 @@ jobs:
   upload_internet_archive:
     needs: crawl
     runs-on: ubuntu-latest
-    # Աշխատում է միշտ, զուգահեռ GitHub uploader-ի հետ, նույնիսկ եթե cancel է եղել
     if: always() && needs.crawl.outputs.COUNT != '0' && needs.crawl.outputs.ARCHIVE_FILENAME != ''
     timeout-minutes: 50
     steps:
@@ -325,7 +368,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install internetarchive
 
-      - name: Upload Snapshot to Internet Archive (Final)
+      - name: Upload Snapshot to Internet Archive (Final 5-Hour End)
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
