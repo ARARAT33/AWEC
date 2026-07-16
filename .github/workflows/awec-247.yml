@@ -157,10 +157,11 @@ jobs:
           [ -f "$FILE" ] || { echo "❌ Missing $FILE"; exit 1; }
           echo "DB_FILE=$FILE" >> $GITHUB_OUTPUT
 
-      - name: Restore checkpoint if exists
-        continue-on-error: true
+- name: Download spider outputs
         uses: actions/download-artifact@v4
-        with: { name: checkpoint-shard-${{ matrix.shard }}, path: . }
+        with:
+          pattern: spider-output-shard-*
+          path: all_spiders
 
       - name: Extract checkpoint
         run: |
