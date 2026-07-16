@@ -149,9 +149,11 @@ jobs:
         run: |
           SHARD_STR=$(printf "%04d" ${{ matrix.shard }})
           FILE="initial_shards/initial_shard_${SHARD_STR}.db"
-          [ -f "$FILE" ] || { echo "❌ Missing $FILE"; exit 1; }
+          if [ ! -f "$FILE" ]; then
+            echo "❌ Missing $FILE"
+            exit 1
+          fi
           echo "DB_FILE=$FILE" >> $GITHUB_OUTPUT
-
 - name: Download spider outputs
         uses: actions/download-artifact@v4
         with:
