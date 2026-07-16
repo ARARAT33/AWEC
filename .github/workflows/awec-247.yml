@@ -2,7 +2,7 @@
 #  AWEC – Matrix Spiders + Deduplicator + Dual Uploaders
 #  10 spider + 1 dedup-checker + 2 uploader = 13 jobs
 #  Zero data loss, zero duplicates, ultra-fast
-# ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
 name: AWEC – 13-Job Matrix Spiders
 
 on:
@@ -27,7 +27,7 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 0: Prepare initial shards (merges previous + recovery)
+  #  Job 1: Prepare initial shards (merges previous + recovery)
   # ═══════════════════════════════════════════════════════════════════
   prepare-shards:
     runs-on: ubuntu-latest
@@ -130,7 +130,7 @@ jobs:
 
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 1‑10: Spider Matrix (10 parallel workers)
+  #  Jobs 2‑11: Spider Matrix (10 parallel workers)
   # ═══════════════════════════════════════════════════════════════════
   spider-matrix:
     needs: prepare-shards
@@ -165,7 +165,6 @@ jobs:
       - name: Extract checkpoint
         run: |
           if [ -f checkpoint.tar.gz ]; then
-            # 🔄 Ուղղում՝ բացում ենք արխիվը անմիջապես աշխատանքային թղթապանակում
             tar -xzf checkpoint.tar.gz
             echo "🔄 Checkpoint restored (checkpoints/ directory reconstructed)"
           else
@@ -197,7 +196,6 @@ jobs:
         if: cancelled() || failure()
         id: save_ckpt
         run: |
-          # 🔄 Ուղղում՝ արխիվացնում ենք "checkpoints" պապկան այնպես, որ բացելիս այն նույնությամբ վերականգնվի
           if [ -d "checkpoints" ]; then
             tar -czf checkpoint.tar.gz checkpoints
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
@@ -254,16 +252,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { pattern: spider-output-shard-*, path: all_spiders }
 
-      - name: 🔍 Merge + Deduplicate all spider DBs
+      - name: Merge and Deduplicate all spider DBs
         run: |
-          # 🔄 Ուղղում՝ նախքան Python-ը աշխատեցնելը, բոլոր սարդերի tar.gz արխիվները պետք է բացել
-          # քանի որ նախորդ քայլում դրանք որպես tar.gz էինք վերբեռնել։
           python3 -c "
           import glob, tarfile, os
-          for f in glob.glob('all_spiders/**/*.tar.gz', recursive=True):
-              print(f'Extracting {f}...')
-              with tarfile.open(f, 'r:gz') as tar:
-                  tar.extractall(path='extracted_spiders')
+          for f in glob.glob(\"all_spiders/**/*.tar.gz\", recursive=True):
+              print(f\"Extracting {f}...\")
+              with tarfile.open(f, \"r\") as tar:
+                  tar.extractall(path=\"extracted_spiders\")
           "
 
           python3 << 'PYEOF'
@@ -338,9 +334,8 @@ jobs:
           master.close()
           PYEOF
 
-      - name: 📦 Package deduplicated output
+      - name: Package deduplicated output
         run: |
-          # 🔄 Ուղղում՝ արխիվացնում ենք երկուսն էլ՝ առանց ծնողական թղթապանակների խնդրի
           tar -I pigz -cf dedup-output.tar.gz final_shards links.txt
 
       - uses: actions/upload-artifact@v4
@@ -348,7 +343,7 @@ jobs:
 
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 12: GitHub Release Uploader (0-minute timer)
+  #  Job 12: GitHub Release Uploader
   # ═══════════════════════════════════════════════════════════════════
   github-release-upload:
     needs: deduplicator
@@ -384,7 +379,7 @@ jobs:
 
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 13: Internet Archive Uploader (0-minute timer)
+  #  Job 13: Internet Archive Uploader
   # ═══════════════════════════════════════════════════════════════════
   internet-archive-upload:
     needs: deduplicator
