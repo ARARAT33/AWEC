@@ -1,13 +1,15 @@
 # ═══════════════════════════════════════════════════════════════════════
-#  AWEC – Matrix Chain Collector (Fully Sync'd with collector_247.py)
-# ═══════════════════════════════════════════════════════════════════════
-name: AWEC – Matrix Chain Collector
+#  AWEC – Matrix Spiders + Deduplicator + Dual Uploaders
+#  10 spider + 1 dedup-checker + 2 uploader = 13 jobs
+#  Zero data loss, zero duplicates, ultra-fast
+# ═══════════════════════════════════════════════════════════════════
+name: AWEC – 13-Job Matrix Spiders
 
 on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 */5 * * *' # Աշխատում է յուրաքանչյուր 5 ժամը մեկ
+    - cron: '0 */5 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -21,10 +23,11 @@ env:
   MATRIX_SIZE: 10
   CRAWL_TIME_SEC: 19800              # 5.5 ժամ (330 րոպե)
   MAX_DB_SIZE: 1900000000            # 1.9 GB
+  DEDUP_BATCH: 1000000               # 1M տող յուրաքանչյուր batch-ում
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 0: Նախորդ տվյալների հավաքագրում և սկզբնական Shard-ների պատրաստում
+  #  Job 0: Prepare initial shards (merges previous + recovery)
   # ═══════════════════════════════════════════════════════════════════
   prepare-shards:
     runs-on: ubuntu-latest
@@ -32,20 +35,13 @@ jobs:
     outputs:
       TOTAL_OLD: ${{ steps.prep.outputs.TOTAL_OLD }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2
 
       - name: Download latest release shards
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env: { GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
         run: |
           mkdir -p prev_release
           ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
@@ -55,24 +51,21 @@ jobs:
             cd prev_release
             echo "$ASSETS" | while read -r url name; do echo "$url" >> urls.txt; done
             aria2c -x8 -s8 -j8 -i urls.txt --console-log-level=warn
-            echo "✅ Ներբեռնված է $(ls -1 | wc -l) shard նախորդ release-ից"
+            echo "✅ Downloaded $(ls -1 | wc -l) shards"
           else
-            echo "ℹ️ Նախորդ release չի գտնվել"
+            echo "ℹ️ No previous release"
           fi
 
-      - name: Download recovery checkpoints (if any)
-        id: download_checkpoints
+      - name: Download recovery checkpoints
+        id: dl_checkpoints
         continue-on-error: true
         uses: actions/download-artifact@v4
-        with:
-          pattern: checkpoint-shard-*
-          path: recovery_checkpoints
+        with: { pattern: checkpoint-shard-*, path: recovery_checkpoints }
 
       - name: Merge all sources into one links.db
         run: |
           python3 << 'PYEOF'
           import sqlite3, os, glob
-
           files = []
           for d in ["prev_release", "recovery_checkpoints"]:
               if os.path.isdir(d):
@@ -81,77 +74,53 @@ jobs:
           if not files:
               conn = sqlite3.connect("links.db")
               conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
-              conn.commit()
-              conn.close()
-              print("ℹ️ Ոչ մի աղբյուր չգտնվեց, ստեղծվեց դատարկ DB")
+              conn.commit(); conn.close()
+              print("ℹ️ Empty DB created")
               exit(0)
-
-          # Վերցնում ենք սխեման առաջին պատահած ֆայլից
           tmp = sqlite3.connect(files[0])
           schema = tmp.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='urls'").fetchone()[0]
           tmp.close()
-
           main = sqlite3.connect("links.db")
-          main.execute("PRAGMA journal_mode=OFF")
-          main.execute("PRAGMA synchronous=OFF")
-          main.execute("PRAGMA cache_size=-2000000")
-          main.execute(schema)
-          main.commit()
-
+          main.execute("PRAGMA journal_mode=OFF"); main.execute("PRAGMA synchronous=OFF")
+          main.execute("PRAGMA cache_size=-2000000"); main.execute(schema); main.commit()
           for f in files:
               main.execute(f"ATTACH DATABASE '{f}' AS src")
               main.execute("INSERT OR IGNORE INTO main.urls SELECT * FROM src.urls")
               main.execute("DETACH DATABASE src")
-              print(f"➕ Միավորվեց՝ {os.path.basename(f)}")
-
+              print(f"➕ {os.path.basename(f)} merged")
           main.close()
-          print("🎉 Բոլոր տվյալները միավորվեցին links.db-ում")
+          print("🎉 All sources unified")
           PYEOF
 
       - name: Split into initial shards
         run: |
           python3 << 'PYEOF'
           import sqlite3, os, hashlib
-
-          SRC = "links.db"
-          N = int(os.environ["MATRIX_SIZE"])
+          SRC = "links.db"; N = int(os.environ["MATRIX_SIZE"])
           os.makedirs("initial_shards", exist_ok=True)
-
-          src = sqlite3.connect(SRC)
-          c = src.cursor()
+          src = sqlite3.connect(SRC); c = src.cursor()
           c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='urls'")
           schema = c.fetchone()[0]
-
           conns = []
           for i in range(N):
               name = f"initial_shards/initial_shard_{i:04d}.db"
               conn = sqlite3.connect(name)
-              conn.execute("PRAGMA synchronous=OFF")
-              conn.execute("PRAGMA journal_mode=OFF")
-              conn.execute(schema)
-              conns.append(conn)
-
-          c.execute("SELECT url FROM urls")
-          count = 0
+              conn.execute("PRAGMA synchronous=OFF"); conn.execute("PRAGMA journal_mode=OFF")
+              conn.execute(schema); conns.append(conn)
+          c.execute("SELECT url FROM urls"); count = 0
           for (url,) in c:
               bucket = int(hashlib.md5(url.encode()).hexdigest(), 16) % N
               conns[bucket].execute("INSERT OR IGNORE INTO urls VALUES (?)", (url,))
               count += 1
               if count % 1000000 == 0:
-                  for conn in conns: conn.commit()
-          for conn in conns:
-              conn.commit()
-              conn.close()
+                  for x in conns: x.commit()
+          for x in conns: x.commit(); x.close()
           src.close()
-          print(f"✅ {count} URL-ներ բաշխվեցին {N} shard-ների միջև")
+          print(f"✅ {count} URLs split into {N} shards")
           PYEOF
 
-      - name: Upload initial shards as single package
-        uses: actions/upload-artifact@v4
-        with:
-          name: all-initial-shards
-          path: initial_shards/initial_shard_*.db
-          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with: { name: all-initial-shards, path: initial_shards/initial_shard_*.db, retention-days: 1 }
 
       - name: Set outputs
         id: prep
@@ -159,10 +128,11 @@ jobs:
           TOTAL=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo 0)
           echo "TOTAL_OLD=$TOTAL" >> $GITHUB_OUTPUT
 
+
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 1: Զուգահեռ Harvester Matrix (10 Workers)
+  #  Job 1‑10: Spider Matrix (10 parallel workers)
   # ═══════════════════════════════════════════════════════════════════
-  collector-matrix:
+  spider-matrix:
     needs: prepare-shards
     runs-on: ubuntu-latest
     timeout-minutes: 350
@@ -171,55 +141,39 @@ jobs:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
       fail-fast: false
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10', cache: 'pip' }
+      - run: pip install -q aiohttp pigz
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: pip install -q aiohttp pigz
-
-      - name: Download initial shards
-        uses: actions/download-artifact@v4
-        with:
-          name: all-initial-shards
-          path: initial_shards
+      - uses: actions/download-artifact@v4
+        with: { name: all-initial-shards, path: initial_shards }
 
       - name: Find my shard DB
         id: find_db
         run: |
           SHARD_STR=$(printf "%04d" ${{ matrix.shard }})
           FILE="initial_shards/initial_shard_${SHARD_STR}.db"
-          if [ ! -f "$FILE" ]; then
-            echo "❌ Shard DB file ($FILE) not found!"
-            exit 1
-          fi
+          [ -f "$FILE" ] || { echo "❌ Missing $FILE"; exit 1; }
           echo "DB_FILE=$FILE" >> $GITHUB_OUTPUT
 
-      # 🔄 ՎԵՐԱԿԱՆԳՆՈՒՄ: Եթե կա նախորդ կիսատ թողած checkpoint, ներբեռնում և բացում ենք այն
-      - name: Restore checkpoints if available
+      - name: Restore checkpoint if exists
         continue-on-error: true
         uses: actions/download-artifact@v4
-        with:
-          name: checkpoint-shard-${{ matrix.shard }}
-          path: .
-      
+        with: { name: checkpoint-shard-${{ matrix.shard }}, path: . }
+
       - name: Extract checkpoint
         run: |
           if [ -f checkpoint.tar.gz ]; then
+            # 🔄 Ուղղում՝ բացում ենք արխիվը անմիջապես աշխատանքային թղթապանակում
             tar -xzf checkpoint.tar.gz
-            echo "🔄 Checkpoint folder extracted successfully!"
+            echo "🔄 Checkpoint restored (checkpoints/ directory reconstructed)"
           else
-            echo "ℹ️ No checkpoint archive found. Starting fresh."
+            echo "ℹ️ Fresh start"
           fi
 
-      # 🐍 RUN CRAWLER (Աշխատեցնում է քո collector_247.py կոդը)
-      - name: Run crawler
-        id: crawler
+      - name: 🕷️ Run Spider
+        id: spider
         env:
           DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
           SHARD_INDEX: ${{ matrix.shard }}
@@ -229,50 +183,40 @@ jobs:
             --db "$DB_FILE" \
             --shard-index "$SHARD_INDEX" \
             --total-shards "$TOTAL_SHARDS" &
-          CRAWLER_PID=$!
-          
-          # Սպասում ենք 5.5 ժամ կամ մինչև սպրայդերը ինքնուրույն կանգնի
+          SPIDER_PID=$!
           sleep $CRAWL_TIME_SEC &
           SLEEP_PID=$!
-          wait -n $SLEEP_PID $CRAWLER_PID || true
-
-          if kill -0 $CRAWLER_PID 2>/dev/null; then
-            echo "⏰ Ժամանակը սպառվեց (5.5h) – Կատարվում է անվտանգ կանգառ (SIGINT)..."
-            kill -INT $CRAWLER_PID
-            wait $CRAWLER_PID 2>/dev/null || true
+          wait -n $SLEEP_PID $SPIDER_PID || true
+          if kill -0 $SPIDER_PID 2>/dev/null; then
+            echo "⏰ 5.5h – sending SIGINT"
+            kill -INT $SPIDER_PID
+            wait $SPIDER_PID 2>/dev/null || true
           fi
 
-      # 💾 CHECKPOINT-Ի ՊԱՀՊԱՆՈՒՄ (Եթե աշխատանքը ձախողվի կամ GitHub-ը ստիպողաբար կանգնեցնի)
-      - name: Pack checkpoint folder on interruption
+      - name: 💾 Pack checkpoint on interruption
         if: cancelled() || failure()
-        id: save_checkpoint
+        id: save_ckpt
         run: |
+          # 🔄 Ուղղում՝ արխիվացնում ենք "checkpoints" պապկան այնպես, որ բացելիս այն նույնությամբ վերականգնվի
           if [ -d "checkpoints" ]; then
-            tar -czf checkpoint.tar.gz -C checkpoints .
+            tar -czf checkpoint.tar.gz checkpoints
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
-            echo "💾 Checkpoints directory packed."
+            echo "💾 Checkpoint packed"
           else
-            echo "⚠️ checkpoints directory not found!"
+            echo "⚠️ No checkpoints dir found!"
           fi
 
-      - name: Upload checkpoint artifact
-        if: always() && steps.save_checkpoint.outputs.CHECKPOINT_READY == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: checkpoint-shard-${{ matrix.shard }}
-          path: checkpoint.tar.gz
-          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.save_ckpt.outputs.CHECKPOINT_READY == 'true'
+        with: { name: checkpoint-shard-${{ matrix.shard }}, path: checkpoint.tar.gz, retention-days: 1 }
 
-      # 📦 OUTPUT-Ի ՊԱՏՐԱՍՏՈՒՄ: Տվյալների արտահանում և DB-ների բաժանում
-      - name: Prepare final output
+      - name: 📦 Prepare spider output (raw DB + txt)
         if: always()
         env:
           DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
           SHARD_INDEX: ${{ matrix.shard }}
         run: |
           mkdir -p output
-          
-          # Արտահանում ենք URL-ները txt ֆայլի մեջ
           python3 -c "
           import sqlite3
           conn = sqlite3.connect('$DB_FILE')
@@ -285,26 +229,98 @@ jobs:
                   f.writelines(row[0] + '\n' for row in rows)
           conn.close()
           "
-          
-          # DB-ի բաժանում ըստ չափսի (մաքսիմալ 1.9 GB)
-          python3 << PYEOF
-          import sqlite3, os
-          SRC = "$DB_FILE"
-          MAX_SIZE = int(os.environ["MAX_DB_SIZE"])
-          PREFIX = f"links_part_W{os.environ['SHARD_INDEX']}"
-          src_conn = sqlite3.connect(SRC)
-          c = src_conn.cursor()
-          schema = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='urls'").fetchone()[0]
-          
-          last = 0; idx = 1
+          cp "$DB_FILE" output/spider_$SHARD_INDEX.db
+          tar -I pigz -cf spider-output.tar.gz -C output .
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: spider-output-shard-${{ matrix.shard }}, path: spider-output.tar.gz, retention-days: 1 }
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  #  Job 11: Deduplicator – merges 10 spider outputs,
+  #          removes ALL duplicates, splits into final shards
+  # ═══════════════════════════════════════════════════════════════════
+  deduplicator:
+    needs: spider-matrix
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.10' }
+
+      - uses: actions/download-artifact@v4
+        with: { pattern: spider-output-shard-*, path: all_spiders }
+
+      - name: 🔍 Merge + Deduplicate all spider DBs
+        run: |
+          # 🔄 Ուղղում՝ նախքան Python-ը աշխատեցնելը, բոլոր սարդերի tar.gz արխիվները պետք է բացել
+          # քանի որ նախորդ քայլում դրանք որպես tar.gz էինք վերբեռնել։
+          python3 -c "
+          import glob, tarfile, os
+          for f in glob.glob('all_spiders/**/*.tar.gz', recursive=True):
+              print(f'Extracting {f}...')
+              with tarfile.open(f, 'r:gz') as tar:
+                  tar.extractall(path='extracted_spiders')
+          "
+
+          python3 << 'PYEOF'
+          import sqlite3, os, glob
+
+          # 1. Gather all extracted spider DBs
+          spider_dbs = glob.glob("extracted_spiders/spider_*.db")
+          print(f"📊 Found {len(spider_dbs)} extracted spider databases")
+
+          if not spider_dbs:
+              print("❌ No spider DBs found!")
+              exit(1)
+
+          # 2. Create master DB
+          master = sqlite3.connect("master_links.db")
+          master.execute("PRAGMA journal_mode=OFF")
+          master.execute("PRAGMA synchronous=OFF")
+          master.execute("PRAGMA cache_size=-4000000")
+          master.execute("PRAGMA temp_store=MEMORY")
+          master.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
+          master.commit()
+
+          # 3. Merge ALL spider DBs (PRIMARY KEY removes duplicates instantly)
+          for db_path in spider_dbs:
+              master.execute(f"ATTACH DATABASE '{db_path}' AS spider")
+              master.execute("INSERT OR IGNORE INTO main.urls SELECT * FROM spider.urls")
+              master.execute("DETACH DATABASE spider")
+              print(f"➕ {os.path.basename(db_path)} merged")
+
+          # 4. Count + export
+          total = master.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
+          print(f"🎉 Master DB created: {total} UNIQUE URLs (duplicates removed)")
+
+          # 5. Export links.txt
+          with open("links.txt", "w", encoding="utf-8") as f:
+              c = master.execute("SELECT url FROM urls")
+              while True:
+                  rows = c.fetchmany(1000000)
+                  if not rows: break
+                  f.writelines(row[0] + "\n" for row in rows)
+          print(f"✅ links.txt exported ({os.path.getsize('links.txt')} bytes)")
+
+          # 6. Split into <2GB final shards
+          MAX_SIZE = int(os.environ.get("MAX_DB_SIZE", 1900000000))
+          os.makedirs("final_shards", exist_ok=True)
+          last = 0; idx = 1; total_split = 0
           while True:
-              name = f"output/{PREFIX}_{idx:04d}.db"
+              name = f"final_shards/links_part_{idx:04d}.db"
               shard = sqlite3.connect(name)
-              shard.execute(schema)
+              shard.execute("PRAGMA synchronous=OFF"); shard.execute("PRAGMA journal_mode=OFF")
+              shard.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
               rows = 0
               while True:
-                  c.execute(f"SELECT rowid, url FROM urls WHERE rowid>{last} LIMIT 200000")
-                  batch = c.fetchall()
+                  batch = master.execute(
+                      "SELECT rowid, url FROM urls WHERE rowid > ? ORDER BY rowid ASC LIMIT 500000",
+                      (last,)
+                  ).fetchall()
                   if not batch: break
                   last = batch[-1][0]
                   shard.executemany("INSERT INTO urls VALUES (?)", [(r[1],) for r in batch])
@@ -314,59 +330,94 @@ jobs:
               if rows == 0:
                   if os.path.exists(name): os.remove(name)
                   break
+              total_split += rows
+              print(f"✅ Shard {name} – {rows} rows")
               idx += 1
               if not batch: break
-          src_conn.close()
+          print(f"🎉 Total split: {total_split} rows into {idx-1} shards")
+          master.close()
           PYEOF
 
-          tar -I pigz -cf final-output.tar.gz -C output .
+      - name: 📦 Package deduplicated output
+        run: |
+          # 🔄 Ուղղում՝ արխիվացնում ենք երկուսն էլ՝ առանց ծնողական թղթապանակների խնդրի
+          tar -I pigz -cf dedup-output.tar.gz final_shards links.txt
 
-      - name: Upload final output artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: collector-output-shard-${{ matrix.shard }}
-          path: final-output.tar.gz
-          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with: { name: dedup-output, path: dedup-output.tar.gz, retention-days: 1 }
+
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 2: Տվյալների հավաքագրում և GitHub Release
+  #  Job 12: GitHub Release Uploader (0-minute timer)
   # ═══════════════════════════════════════════════════════════════════
   github-release-upload:
-    needs: collector-matrix
+    needs: deduplicator
     if: always() && !cancelled()
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
-      - name: Download all worker artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: collector-output-shard-*
-          path: all_workers
+      - uses: actions/download-artifact@v4
+        with: { name: dedup-output, path: . }
 
-      - name: Extract and merge assets
-        run: |
-          sudo apt-get install -y pigz
-          mkdir -p release_assets
-          for f in all_workers/*/final-output.tar.gz; do
-            tar -I pigz -xf "$f" -C release_assets
-          done
-          cat release_assets/links_*.txt > links.txt 2>/dev/null || true
+      - name: Extract
+        run: tar -I pigz -xf dedup-output.tar.gz
 
-      - name: Create GitHub Release & Upload
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: v-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: 🚀 Create GitHub Release & Upload
+        env: { GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}', TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}' }
         run: |
           echo "$GITHUB_TOKEN" | gh auth login --with-token
           TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
           gh release create "$TAG" \
             --title "AWEC Run $(date +'%Y%m%d_%H%M%S')" \
-            --notes "${TOTAL} նոր URL-ներ հավաքագրվել են այս ցիկլում։" \
-            --target main || echo "⚠️ Release-ը արդեն գոյություն ունի"
+            --notes "${TOTAL} unique links collected" \
+            --target main || echo "⚠️ Release exists"
 
-          cd release_assets
+          cd final_shards
           for f in links_part_*.db; do
             [ -f "$f" ] && gh release upload "$TAG" "$f" --clobber &
           done
-          [ -f ../links.txt ] && gh release upload "$TAG" ../links.txt --clobber &
+          if [ -f ../links.txt ]; then
+            gh release upload "$TAG" ../links.txt --clobber &
+          fi
           wait
+          echo "✅ GitHub Release complete"
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  #  Job 13: Internet Archive Uploader (0-minute timer)
+  # ═══════════════════════════════════════════════════════════════════
+  internet-archive-upload:
+    needs: deduplicator
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dedup-output, path: . }
+
+      - name: Extract
+        run: tar -I pigz -xf dedup-output.tar.gz
+
+      - name: 📤 Upload to Internet Archive
+        env:
+          IA_ACCESS_KEY: '${{ secrets.IA_ACCESS_KEY }}'
+          IA_SECRET_KEY: '${{ secrets.IA_SECRET_KEY }}'
+          IA_ID: 'awec_links_${{ github.run_id }}_${{ github.run_attempt }}'
+        run: |
+          pip install -q internetarchive
+          mkdir -p ~/.config
+          cat << EOF > ~/.config/ia.ini
+          [s3]
+          access = $IA_ACCESS_KEY
+          secret = $IA_SECRET_KEY
+          EOF
+
+          cd final_shards
+          for f in links_part_*.db; do
+            [ -f "$f" ] && ia upload "$IA_ID" "$f" --retries 5 &
+          done
+          if [ -f ../links.txt ]; then
+            ia upload "$IA_ID" ../links.txt --retries 5 &
+          fi
+          wait
+          echo "✅ IA upload complete"
