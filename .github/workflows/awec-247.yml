@@ -2,30 +2,31 @@ name: AWEC Continuous Link Collector
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   schedule:
-    - cron: '0 */5 * * *' # Ամեն 5 ժամը մեկ
-  workflow_dispatch:      # Ձեռքով թողարկելու հնարավորություն
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
 
 concurrency:
-  group: aw_crawler_group
+  group: awec_crawler_group
   cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  crawl:
+  # ──────────────────────────────────────────────
+  #  Job 1: Collector – 5 ժամ հավաքում, ապահով
+  #  merge / split, artifact-ի մեջ shard-ներ
+  # ──────────────────────────────────────────────
+  collector:
     runs-on: ubuntu-latest
-    timeout-minutes: 320
+    timeout-minutes: 360
     outputs:
-      COUNT: ${{ steps.prep.outputs.COUNT }}
-      TAG_NAME: ${{ steps.prep.outputs.TAG_NAME }}
-      TIMESTAMP: ${{ steps.prep.outputs.TIMESTAMP }}
-      ARCHIVE_FILENAME: ${{ steps.prep.outputs.ARCHIVE_FILENAME }}
+      tag_name: ${{ steps.prep.outputs.TAG_NAME }}
+      timestamp: ${{ steps.prep.outputs.TIMESTAMP }}
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -36,353 +37,317 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
 
-      - name: Install System Dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y sqlite3 jq curl pv
 
-      - name: Install Python Requirements
+      - name: Install Python requirements
         run: |
           python -m pip install --upgrade pip
           python -m pip install aiohttp internetarchive beautifulsoup4 requests
 
-      - name: Download Last DB with Progress (%)
+      # ── 1. Ներբեռնել նախորդ release-ի բոլոր .db մասերը ──
+      - name: Download previous DB shards
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "🔄 Փնտրում ենք վերջին տվյալների բազան..."
+          echo "📥 Փնտրում ենք նախորդ release-ը..."
           RELEASE_DATA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            https://api.github.com/repos/${{ github.repository }}/releases/latest || true)
-          
-          DOWNLOAD_URL=$(echo "$RELEASE_DATA" | jq -r '.assets[] | select(.name=="links.db") | .url' 2>/dev/null || echo "")
-          
-          if [ -n "$DOWNLOAD_URL" ] && [ "$DOWNLOAD_URL" != "null" ]; then
-            echo "📥 Գտնվեց նախորդ բազան։ Ներբեռնում ենք..."
-            curl -L -H "Authorization: token $GITHUB_TOKEN" \
-                 -H "Accept: application/octet-stream" \
-                 -o links.db "$DOWNLOAD_URL" --progress-bar
-            echo "✅ Ներբեռնումն ավարտվեց։"
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest" || true)
+
+          ASSETS=$(echo "$RELEASE_DATA" | jq -r '
+            .assets[]? | select(.name | test("^links_part_\\d+\\.db$")) | 
+            "\(.name) \(.url)"' 2>/dev/null || echo "")
+
+          mkdir -p previous_shards
+          if [ -n "$ASSETS" ]; then
+            echo "$ASSETS" | sort -V | while IFS=' ' read -r NAME URL; do
+              echo "⬇️ $NAME"
+              curl -L -H "Authorization: token $GITHUB_TOKEN" \
+                   -H "Accept: application/octet-stream" \
+                   -o "previous_shards/$NAME" "$URL" --progress-bar
+            done
+            echo "✅ Ներբեռնված մասեր՝"
+            ls -lh previous_shards/
           else
-            echo "ℹ️ Նախորդ բազա չգտնվեց։ Կստեղծվի նորը..."
+            echo "ℹ️ Նախորդ բազա չկա, սկսում ենք զրոյից"
           fi
 
-      - name: Check and Repair SQLite Database with Status (%)
+      # ── 2. Ապահով միացնել բոլոր shard-ները մեկ links.db-ում ──
+      - name: Safely merge previous shards into working DB
         run: |
-          if [ -f "links.db" ]; then
-            echo "🛠️ Ստուգում ենք բազայի ամբողջականությունը..."
-            INTEGRITY=$(sqlite3 integrity_check "PRAGMA integrity_check;" 2>&1 || echo "error")
-            
+          python3 << 'PYEOF'
+          import sqlite3, os, shutil
+
+          WORK_DB = "links.db"
+          SHARD_DIR = "previous_shards"
+          shards = sorted(
+              [f for f in os.listdir(SHARD_DIR) if f.endswith(".db")],
+              key=lambda x: int(x.split('_part_')[1].split('.')[0])
+          )
+
+          if not shards:
+              # Ստեղծում ենք դատարկ բազա՝ նույն սխեմայով, որը կստեղծի collector_247.py-ն
+              print("📭 Չկան նախորդ shard-ներ, կստեղծվի նորը crawler-ի կողմից")
+              exit(0)
+
+          # Վերցնում ենք առաջին shard-ի սխեման
+          shutil.copyfile(os.path.join(SHARD_DIR, shards[0]), WORK_DB)
+          main_conn = sqlite3.connect(WORK_DB)
+          main_conn.execute("PRAGMA journal_mode=WAL")
+          main_conn.execute("DELETE FROM urls")  # մաքրում ենք, եթե մեջը տվյալ կար
+
+          for shard in shards:
+              shard_path = os.path.join(SHARD_DIR, shard)
+              main_conn.execute(f"ATTACH DATABASE '{shard_path}' AS shard")
+              main_conn.execute("INSERT INTO main.urls SELECT * FROM shard.urls")
+              main_conn.execute("DETACH DATABASE shard")
+              print(f"➕ {shard} միացված")
+
+          main_conn.commit()
+          main_conn.close()
+          print("🎉 Բոլոր shard-ները ապահով միացված են links.db-ում")
+          PYEOF
+
+      # ── 3. Ստուգել / բուժել աշխատանքային բազան ──
+      - name: Check and repair SQLite database
+        run: |
+          if [ -f links.db ]; then
+            echo "🛠️ Ստուգում..."
+            INTEGRITY=$(sqlite3 links.db "PRAGMA integrity_check;" 2>&1 || echo "error")
             if [ "$INTEGRITY" != "ok" ] || [[ "$INTEGRITY" == *"error"* ]] || [[ "$INTEGRITY" == *"malformed"* ]]; then
-              echo "⚠️ Բազան վնասված է։ Սկսում ենք բուժման գործընթացը..."
-              
+              echo "⚠️ Բազան վնասված է, փորձում ենք բուժել..."
               OLD_ROWS=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo "0")
-              
               mv links.db links_corrupted.db
               sqlite3 links_corrupted.db ".recover" | sqlite3 links.db
-              
-              if [ -f "links.db" ]; then
+              if [ -f links.db ]; then
                 NEW_ROWS=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo "0")
-                
-                if [ "$OLD_ROWS" -gt 0 ]; then
-                  RECOVERY_RATE=$(( (NEW_ROWS * 100) / OLD_ROWS ))
-                else
-                  RECOVERY_RATE=100
-                fi
-                echo "🎉 Բուժումն ավարտվեց։ Վերականգնվել է տվյալների $RECOVERY_RATE% -ը ($NEW_ROWS / $OLD_ROWS հղում)։"
+                RECOVERY_RATE=$(( OLD_ROWS > 0 ? (NEW_ROWS * 100 / OLD_ROWS) : 100 ))
+                echo "🎉 Վերականգնվել է ~$RECOVERY_RATE% ($NEW_ROWS/$OLD_ROWS)"
                 rm -f links_corrupted.db
               else
-                echo "🚨 Բուժումը ձախողվեց։ Ստեղծվում է դատարկ բազա..."
+                echo "🚨 Բուժումը ձախողվեց, կշարունակենք դատարկ բազայով"
                 rm -f links_corrupted.db
               fi
             else
-              echo "✅ Բազան 100% առողջ է, բուժման կարիք չկա։"
+              echo "✅ Բազան 100% առողջ է"
             fi
           fi
 
-      - name: Run AWEC Planetary Crawler with Hot-Release on 2GB Limit
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
+      # ── 4. Crawler – 5 ժամ ──
+      - name: Run AWEC Planetary Crawler (5 hours)
         run: |
-          echo "🚀 Սկսում ենք սարդի աշխատանքը..."
-          
-          # Միացնում ենք սարդը ֆոնային ռեժիմով
+          echo "🚀 Crawler-ը միանում է..."
           python collector_247.py &
           SPIDER_PID=$!
-          
-          echo "🕷️ Սարդը միացավ PID $SPIDER_PID-ով։ Սկսում ենք ակտիվ մոնիտորինգը..."
-          
-          MAX_TIME=18000      # 5 ժամ
-          MAX_SIZE=2093796556 # ~1.95 ԳԲ
-          ELAPSED=0
-          INTERVAL=15
-          PART_NUM=1          # Ինդեքս, եթե 5 ժամում մի քանի հատ 2ԳԲ-անոց ֆայլ ստացվի
-          
-          # Պատրաստում ենք Python սկրիպտ՝ արագ Release սարքելու և վերբեռնելու համար
-          cat << 'EOF' > hot_release.py
-          import os, json, sys, urllib.request
-          token = os.environ.get('GITHUB_TOKEN')
-          repo = os.environ.get('REPOSITORY')
-          filepath = sys.argv[1]
-          tag = sys.argv[2]
-          
-          # Ստեղծում ենք միջանկյալ Release
-          headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json", "Content-Type": "application/json"}
-          data = {"tag_name": tag, "name": f"AWEC Hot-Release {tag}", "body": "Intermediate 2GB Database Snapshot.", "draft": False, "prerelease": False}
-          
-          try:
-              req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases", data=json.dumps(data).encode('utf-8'), headers=headers, method="POST")
-              with urllib.request.urlopen(req) as r:
-                  release_id = json.loads(r.read().decode()).get('id')
-              
-              # Վերբեռնում ենք 2ԳԲ-անոց ֆայլը
-              upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={filepath}"
-              headers_upload = {"Authorization": f"token {token}", "Content-Type": "application/octet-stream"}
-              with open(filepath, "rb") as f:
-                  file_data = f.read()
-              req_upload = urllib.request.Request(upload_url, data=file_data, headers=headers_upload, method="POST")
-              with urllib.request.urlopen(req_upload) as resp:
-                  print(f"✅ Hot-Uploaded {filepath} successfully.")
-          except Exception as e:
-              print(f"❌ Hot-Upload failed: {e}")
-          EOF
-
-          while [ $ELAPSED -lt $MAX_TIME ]; do
-            if ! kill -0 $SPIDER_PID 2>/dev/null; then
-              echo "ℹ️ Սարդն ինքնուրույն ավարտեց աշխատանքը։"
-              break
-            fi
-            
-            if [ -f "links.db" ]; then
-              SIZE=$(stat -c%s "links.db" 2>/dev/null || stat -f%z "links.db" 2>/dev/null || echo 0)
-              if [ "$SIZE" -ge "$MAX_SIZE" ]; then
-                echo "⚠️ Բազայի չափը հասավ 2 ԳԲ-ի։ Սկսում ենք Hot-Release գործընթացը..."
-                
-                TIMESTAMP_HOT=$(date -d '+4 hours' +'%Y%m%d_%H%M%S')
-                HOT_TAG="v-hot-${TIMESTAMP_HOT}-part${PART_NUM}"
-                HOT_FILENAME="links_part${PART_NUM}_${TIMESTAMP_HOT}.db"
-                
-                # Պատճենում ենք ֆայլը, որպեսզի սարդի աշխատանքին չխանգարենք
-                cp links.db "$HOT_FILENAME"
-                
-                # Դատարկում ենք ակտիվ links.db-ն, որ սարդը շարունակի գրել զրոյից
-                sqlite3 links.db "VACUUM;" 2>/dev/null || true
-                > links.db 
-                
-                # Ֆոնային ռեժիմով ուղարկում ենք GitHub Release (որպեսզի սարդի աշխատանքը չկանգնի սպասելուց)
-                python hot_release.py "$HOT_FILENAME" "$HOT_TAG" &
-                
-                PART_NUM=$((PART_NUM + 1))
-              fi
-            fi
-            
-            sleep $INTERVAL
-            ELAPSED=$((ELAPSED + INTERVAL))
-          done
-          
-          echo "⏰ 5 ժամը լրացավ։ Կանգնեցնում ենք սարդին..."
+          echo "PID=$SPIDER_PID"
+          sleep 18000
+          echo "⏰ 5 ժամը լրացավ, կանգնեցնում ենք..."
           kill -2 $SPIDER_PID
           wait $SPIDER_PID || true
-          echo "✅ Սարդը հաջողությամբ կանգնեցվեց։"
+          echo "✅ Crawler-ը կանգնեցվեց"
 
-      - name: Export DB to Plain Text (Final)
+      # ── 5. Export links.txt ──
+      - name: Export links to plain text
         if: always()
         run: |
           cat << 'EOF' > export_links.py
-          import sqlite3
-          import os
+          import sqlite3, os
           if os.path.exists('links.db'):
               try:
                   conn = sqlite3.connect('links.db')
-                  cursor = conn.cursor()
-                  cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='urls'")
-                  if cursor.fetchone():
-                      cursor.execute('SELECT url FROM urls')
-                      urls = cursor.fetchall()
+                  c = conn.cursor()
+                  c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='urls'")
+                  if c.fetchone():
+                      c.execute('SELECT url FROM urls')
                       with open('links.txt', 'w', encoding='utf-8') as f:
-                          for u in urls:
-                              f.write(u[0] + '\n')
-                      print(f'🎉 Exported {len(urls)} links.')
-                  else:
-                      print('Table urls does not exist!')
+                          for row in c:
+                              f.write(row[0] + '\n')
+                      print(f'🎉 Export {c.rowcount} links')
                   conn.close()
               except Exception as e:
-                  print('Export failed:', e)
+                  print(f'Export failed: {e}')
           else:
-              print('links.db not found!')
+              print('links.db not found')
           EOF
           python export_links.py
 
-      - name: Prepare Unique Release Tag and Filename (Final)
-        if: always()
-        id: prep
+      # ── 6. Ապահով բաժանել links.db-ն <2GB shard-ների ──
+      - name: Safely split database into shards (<2GB each)
         run: |
-          if [ -f "links.db" ]; then
-            COUNT=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo "0")
-          else
-            COUNT=0
-          fi
-          
-          TIMESTAMP=$(date -d '+4 hours' +'%Y%m%d_%H%M%S')
-          TAG_NAME="v-${TIMESTAMP}"
-          ARCHIVE_FILENAME="${TIMESTAMP}_links_${COUNT}.db"
-          
-          echo "COUNT=$COUNT" >> $GITHUB_OUTPUT
-          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
-          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_OUTPUT
-          echo "ARCHIVE_FILENAME=$ARCHIVE_FILENAME" >> $GITHUB_OUTPUT
-          
-          if [ -f "links.db" ]; then
-            cp links.db "$ARCHIVE_FILENAME"
-          fi
+          python3 << 'PYEOF'
+          import sqlite3, os
 
-      - name: Save Artifacts for Uploaders (Hard Drive)
-        if: always()
+          SRC_DB = "links.db"
+          MAX_SIZE = 1_900_000_000  # 1.9 GB
+          SHARD_DIR = "shards"
+          os.makedirs(SHARD_DIR, exist_ok=True)
+
+          if not os.path.exists(SRC_DB):
+              print("⚠️ links.db չկա, split-ի կարիք չկա")
+              exit(0)
+
+          src_conn = sqlite3.connect(SRC_DB)
+          src_conn.execute("PRAGMA journal_mode=WAL")
+          src_c = src_conn.cursor()
+
+          # Ստանում ենք սխեման
+          src_c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='urls'")
+          schema = src_c.fetchone()[0]
+          src_c.execute("SELECT COUNT(*) FROM urls")
+          total_rows = src_c.fetchone()[0]
+          print(f"📊 Ընդհանուր {total_rows} տող")
+
+          BATCH_SIZE = 100_000
+          offset = 0
+          shard_idx = 1
+
+          while offset < total_rows:
+              shard_name = os.path.join(SHARD_DIR, f"links_part_{shard_idx:04d}.db")
+              if os.path.exists(shard_name):
+                  os.remove(shard_name)
+              shard_conn = sqlite3.connect(shard_name)
+              shard_conn.execute(schema)
+              shard_conn.execute("DELETE FROM urls")
+              shard_conn.commit()
+
+              rows_copied = 0
+              while offset < total_rows:
+                  # Միանգամից մեծ batch
+                  end = min(offset + BATCH_SIZE, total_rows)
+                  src_c.execute(
+                      f"SELECT * FROM urls LIMIT {end - offset} OFFSET {offset}"
+                  )
+                  batch = src_c.fetchall()
+                  if not batch:
+                      break
+                  shard_conn.executemany("INSERT INTO urls VALUES (?)", 
+                                         [(row[0],) for row in batch])
+                  rows_copied += len(batch)
+                  offset = end
+                  # Չափել ֆայլը
+                  if os.path.getsize(shard_name) >= MAX_SIZE:
+                      break
+
+              shard_conn.commit()
+              shard_conn.close()
+              print(f"✅ {shard_name} – {rows_copied} rows, size {os.path.getsize(shard_name)}")
+              shard_idx += 1
+
+          src_conn.close()
+          print("🎉 Split ավարտված")
+          PYEOF
+
+      # ── 7. Արխիվացնել shard-ները + links.txt artifact-ի մեջ ──
+      - name: Package shards and links.txt
+        run: |
+          tar -czf collector-output.tar.gz shards links.txt
+
+      - name: Upload collector artifact
         uses: actions/upload-artifact@v4
         with:
-          name: crawl-artifacts
-          path: |
-            links.db
-            links.txt
-            *_links_*.db
+          name: collector-output
+          path: collector-output.tar.gz
           retention-days: 1
 
-      - name: Wait 30s and Trigger Next Loop Automatically
+      # ── 8. Ելքային փոփոխականներ ──
+      - name: Prepare tag & timestamp
+        id: prep
         if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "💤 Սպասում ենք 30 վայրկյան..."
-          sleep 30
-          
-          RUNS_COUNT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/runs?status=queued" \
-            | jq '.total_count')
-          
-          if [ "$RUNS_COUNT" -eq 0 ] || [ -z "$RUNS_COUNT" ]; then
-            echo "🔄 Կանչում ենք հաջորդ ցիկլը..."
-            curl -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/dispatches \
-              -d '{"ref":"main"}'
-          else
-            echo "ℹ️ Հերթում արդեն կա սպասող աշխատանք։"
+          # Հաշվում ենք ընդհանուր հղումները (մի քանի shard-ից)
+          TOTAL=0
+          for db in shards/links_part_*.db; do
+            if [ -f "$db" ]; then
+              CNT=$(sqlite3 "$db" "SELECT COUNT(*) FROM urls" 2>/dev/null || echo 0)
+              TOTAL=$((TOTAL + CNT))
+            fi
+          done
+          TIMESTAMP=$(date -d '+4 hours' +'%Y%m%d_%H%M%S')
+          TAG_NAME="v-${TIMESTAMP}"
+          echo "COUNT=$TOTAL" >> $GITHUB_OUTPUT
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+  # ──────────────────────────────────────────────
+  #  Job 2: GitHub Release Uploader
+  # ──────────────────────────────────────────────
+  github-release-upload:
+    needs: collector
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      TAG: ${{ needs.collector.outputs.tag_name }}
+    steps:
+      - name: Download collector artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: collector-output
+
+      - name: Extract artifact
+        run: tar -xzf collector-output.tar.gz
+
+      - name: Authenticate GitHub CLI
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
+
+      - name: Create GitHub Release
+        run: |
+          # Հաշվում ենք ընդհանուր հղումները
+          TOTAL=0
+          for db in shards/links_part_*.db; do
+            [ -f "$db" ] && TOTAL=$(( TOTAL + $(sqlite3 "$db" "SELECT COUNT(*) FROM urls" 2>/dev/null || echo 0) ))
+          done
+          gh release create "$TAG" \
+            --title "AWEC Run $TAG" \
+            --notes "Successfully collected ${TOTAL} links." \
+            --target main || echo "⚠️ Release might already exist"
+
+      - name: Upload all shards + links.txt to release
+        run: |
+          cd shards
+          for file in links_part_*.db; do
+            [ -f "$file" ] && gh release upload "$TAG" "$file" --clobber
+          done
+          if [ -f ../links.txt ]; then
+            gh release upload "$TAG" ../links.txt --clobber
           fi
 
-  upload_github:
-    needs: crawl
+  # ──────────────────────────────────────────────
+  #  Job 3: Internet Archive Uploader
+  # ──────────────────────────────────────────────
+  internet-archive-upload:
+    needs: collector
     runs-on: ubuntu-latest
-    if: always() && needs.crawl.outputs.COUNT != '0' && needs.crawl.outputs.COUNT != ''
-    timeout-minutes: 50
+    timeout-minutes: 350
+    env:
+      IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
+      IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
     steps:
-      - name: Download Artifacts
+      - name: Download collector artifact
         uses: actions/download-artifact@v4
         with:
-          name: crawl-artifacts
-          path: .
+          name: collector-output
 
-      - name: Create New GitHub Release and Upload Unique Assets (Final)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          TAG: ${{ needs.crawl.outputs.TAG_NAME }}
-          COUNT: ${{ needs.crawl.outputs.COUNT }}
+      - name: Extract artifact
+        run: tar -xzf collector-output.tar.gz
+
+      - name: Upload to Internet Archive
         run: |
-          cat << 'EOF' > release_manager.py
-          import os
-          import json
-          import urllib.request
-
-          token = os.environ.get('GITHUB_TOKEN')
-          repo = os.environ.get('REPOSITORY')
-          tag = os.environ.get('TAG')
-          count = os.environ.get('COUNT')
-
-          release_url = f"https://api.github.com/repos/{repo}/releases"
-          headers = {
-              "Authorization": f"token {token}",
-              "Accept": "application/vnd.github.v3+json",
-              "Content-Type": "application/json"
-          }
-          data = {
-              "tag_name": tag,
-              "name": f"AWEC Run {tag}",
-              "body": f"Successfully collected {count} links.",
-              "draft": False,
-              "prerelease": False
-          }
-
-          req = urllib.request.Request(release_url, data=json.dumps(data).encode('utf-8'), headers=headers, method="POST")
-          try:
-              with urllib.request.urlopen(req) as r:
-                  res = json.loads(r.read().decode())
-                  release_id = res.get('id')
-                  print(f"🎉 Release created successfully. ID: {release_id}")
-          except Exception as e:
-              print(f"❌ Error creating release: {e}")
-              exit(1)
-
-          def upload_asset(filepath, name, content_type):
-              if not os.path.exists(filepath):
-                  print(f"⚠️ File {filepath} not found.")
-                  return
-              upload_url = f"https://uploads.github.com/repos/{repo}/releases/{release_id}/assets?name={name}"
-              headers_upload = {
-                  "Authorization": f"token {token}",
-                  "Content-Type": content_type
-              }
-              try:
-                  with open(filepath, "rb") as f:
-                      file_data = f.read()
-                  req_upload = urllib.request.Request(upload_url, data=file_data, headers_upload, method="POST")
-                  with urllib.request.urlopen(req_upload) as resp:
-                      print(f"✅ Uploaded {name} successfully.")
-              except Exception as e:
-                  print(f"❌ Failed to upload {name}: {e}")
-
-          upload_asset("links.db", "links.db", "application/octet-stream")
-          upload_asset("links.txt", "links.txt", "text/plain")
-          EOF
-          python release_manager.py
-
-  upload_internet_archive:
-    needs: crawl
-    runs-on: ubuntu-latest
-    if: always() && needs.crawl.outputs.COUNT != '0' && needs.crawl.outputs.ARCHIVE_FILENAME != ''
-    timeout-minutes: 50
-    steps:
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: crawl-artifacts
-          path: .
-
-      - name: Set up Python for IA
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Internet Archive CLI
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install internetarchive
-
-      - name: Upload Snapshot to Internet Archive (Final 5-Hour End)
-        env:
-          IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
-          IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
-        run: |
-          FILENAME="${{ needs.crawl.outputs.ARCHIVE_FILENAME }}"
-          echo "📤 Ուղարկում ենք Internet Archive: $FILENAME"
           mkdir -p ~/.config
-          cat <<EOF > ~/.config/ia.ini
+          cat << EOF > ~/.config/ia.ini
           [s3]
           access = $IA_ACCESS_KEY
           secret = $IA_SECRET_KEY
           EOF
-          
-          ia upload awec_links_awe_o.s "$FILENAME" \
-            --metadata="title:AWEC Harvest $FILENAME" \
-            --metadata="mediatype:data" \
-            --metadata="collection:opensource"
+
+          IDENTIFIER="awec_links_${{ needs.collector.outputs.timestamp }}"
+          echo "📤 Uploading to IA as $IDENTIFIER"
+
+          # Վերբեռնում ենք բոլոր shard-ները + links.txt
+          for file in shards/links_part_*.db; do
+            [ -f "$file" ] && ia upload "$IDENTIFIER" "$file" --retries 5
+          done
+          [ -f links.txt ] && ia upload "$IDENTIFIER" links.txt --retries 5
+
+          echo "✅ IA upload ավարտված"
