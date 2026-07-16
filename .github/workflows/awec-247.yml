@@ -18,6 +18,12 @@ permissions:
 jobs:
   crawl:
     runs-on: ubuntu-latest
+    timeout-minutes: 320 # Ընդհանուր ժամանակը 5 ժամից մի փոքր ավելի
+    outputs:
+      COUNT: ${{ steps.prep.outputs.COUNT }}
+      TAG_NAME: ${{ steps.prep.outputs.TAG_NAME }}
+      TIMESTAMP: ${{ steps.prep.outputs.TIMESTAMP }}
+      ARCHIVE_FILENAME: ${{ steps.prep.outputs.ARCHIVE_FILENAME }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -93,24 +99,42 @@ jobs:
             fi
           fi
 
-      - name: Run AWEC Planetary Crawler (5 Hours Run Limit)
+      - name: Run AWEC Planetary Crawler (5 Hours / 2GB Size Limit)
         run: |
-          echo "🚀 Սկսում ենք սարդի աշխատանքը 5 ժամով..."
+          echo "🚀 Սկսում ենք սարդի աշխատանքը..."
           
           # Միացնում ենք քո սարդը ֆոնային ռեժիմով (background)
           python collector_247.py &
           SPIDER_PID=$!
           
-          echo "🕷️ Սարդը միացավ PID $SPIDER_PID-ով։ Սպասում ենք 5 ժամ..."
+          echo "🕷️ Սարդը միացավ PID $SPIDER_PID-ով։ Սկսում ենք մոնիտորինգը..."
           
-          # Սպասում ենք 5 ժամ (18000 վայրկյան)
-          sleep 18000
+          MAX_TIME=18000  # 5 ժամ (վայրկյաններով)
+          MAX_SIZE=2093796556 # ~1.95 ԳԲ (որպեսզի 2 ԳԲ-ի սահմանը հաստատ չանցնի)
+          ELAPSED=0
+          INTERVAL=15 # Ստուգել 15 վայրկյանը մեկ
           
-          echo "⏰ 5 ժամը լրացավ։ Կանգնեցնում ենք սարդին..."
-          # Ուղարկում ենք SIGINT (Ctrl+C), որպեսզի Python-ը ապահով պահպանի ամեն ինչ
+          while [ $ELAPSED -lt $MAX_TIME ]; do
+            if ! kill -0 $SPIDER_PID 2>/dev/null; then
+              echo "ℹ️ Սարդն ինքնուրույն ավարտեց աշխատանքը։"
+              break
+            fi
+            
+            if [ -f "links.db" ]; then
+              SIZE=$(stat -c%s "links.db" 2>/dev/null || stat -f%z "links.db" 2>/dev/null || echo 0)
+              if [ "$SIZE" -ge "$MAX_SIZE" ]; then
+                echo "🚨 ԶԳՈՒՇԱՑՈՒՄ: Տվյալների բազան հասել է $(($SIZE / 1024 / 1024)) ՄԲ-ի (մոտենում է 2 ԳԲ սահմանին)։ Կանգնեցնում ենք աշխատանքը..."
+                break
+              fi
+            fi
+            
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+          
+          echo "⏰ Ժամանակը կամ ծավալը սպառվեց։ Կանգնեցնում ենք սարդին..."
+          # Ուղարկում ենք SIGINT (Ctrl+C) անվտանգ կանգնեցման համար
           kill -2 $SPIDER_PID
-          
-          # Սպասում ենք, որ պրոցեսը լրիվ ավարտվի և բազան փակվի
           wait $SPIDER_PID || true
           echo "✅ Սարդը հաջողությամբ կանգնեցվեց։"
 
@@ -165,13 +189,59 @@ jobs:
             cp links.db "$ARCHIVE_FILENAME"
           fi
 
+      - name: Save Artifacts for Uploaders (Hard Drive, not RAM)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-artifacts
+          path: |
+            links.db
+            links.txt
+            *_links_*.db
+          retention-days: 1
+
+      - name: Wait 30s and Trigger Next Loop Automatically
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "💤 Սպասում ենք 30 վայրկյան..."
+          sleep 30
+          
+          RUNS_COUNT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/runs?status=queued" \
+            | jq '.total_count')
+          
+          if [ "$RUNS_COUNT" -eq 0 ] || [ -z "$RUNS_COUNT" ]; then
+            echo "🔄 Կանչում ենք հաջորդ ցիկլը..."
+            curl -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/dispatches \
+              -d '{"ref":"main"}'
+          else
+            echo "ℹ️ Հերթում արդեն կա սպասող աշխատանք։"
+          fi
+
+  upload_github:
+    needs: crawl
+    runs-on: ubuntu-latest
+    # Աշխատում է միշտ (նույնիսկ եթե crawl-ը cancel է եղել), եթե կան հավաքված տվյալներ
+    if: always() && needs.crawl.outputs.COUNT != '0' && needs.crawl.outputs.COUNT != ''
+    timeout-minutes: 50
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: crawl-artifacts
+          path: .
+
       - name: Create New GitHub Release and Upload Unique Assets (Final)
-        if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.COUNT != ''
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
-          TAG: ${{ steps.prep.outputs.TAG_NAME }}
-          COUNT: ${{ steps.prep.outputs.COUNT }}
+          TAG: ${{ needs.crawl.outputs.TAG_NAME }}
+          COUNT: ${{ needs.crawl.outputs.COUNT }}
         run: |
           cat << 'EOF' > release_manager.py
           import os
@@ -232,13 +302,35 @@ jobs:
           EOF
           python release_manager.py
 
+  upload_internet_archive:
+    needs: crawl
+    runs-on: ubuntu-latest
+    # Աշխատում է միշտ, զուգահեռ GitHub uploader-ի հետ, նույնիսկ եթե cancel է եղել
+    if: always() && needs.crawl.outputs.COUNT != '0' && needs.crawl.outputs.ARCHIVE_FILENAME != ''
+    timeout-minutes: 50
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: crawl-artifacts
+          path: .
+
+      - name: Set up Python for IA
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Internet Archive CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install internetarchive
+
       - name: Upload Snapshot to Internet Archive (Final)
-        if: always() && steps.prep.outputs.COUNT != '0' && steps.prep.outputs.ARCHIVE_FILENAME != ''
         env:
           IA_ACCESS_KEY: ${{ secrets.IA_ACCESS_KEY }}
           IA_SECRET_KEY: ${{ secrets.IA_SECRET_KEY }}
         run: |
-          FILENAME="${{ steps.prep.outputs.ARCHIVE_FILENAME }}"
+          FILENAME="${{ needs.crawl.outputs.ARCHIVE_FILENAME }}"
           echo "📤 Ուղարկում ենք Internet Archive: $FILENAME"
           mkdir -p ~/.config
           cat <<EOF > ~/.config/ia.ini
@@ -251,29 +343,3 @@ jobs:
             --metadata="title:AWEC Harvest $FILENAME" \
             --metadata="mediatype:data" \
             --metadata="collection:opensource"
-
-      - name: Wait 30s and Trigger Next Loop Automatically
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "💤 Սպասում ենք 30 վայրկյան..."
-          sleep 30
-          
-          # ՈՒՇԱԴՐՈՒԹՅՈՒՆ. Եթե քո workflow ֆայլի անունը (.github/workflows/-ի մեջ) տարբերվում է awec-247.yml-ից,
-          # ներքևի հղումների մեջ "awec-247.yml" փոխիր քո իրական ֆայլի անունով։
-          
-          RUNS_COUNT=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/runs?status=queued" \
-            | jq '.total_count')
-          
-          if [ "$RUNS_COUNT" -eq 0 ] || [ -z "$RUNS_COUNT" ]; then
-            echo "🔄 Կանչում ենք հաջորդ ցիկլը..."
-            curl -X POST \
-              -H "Authorization: token $GITHUB_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/${{ github.repository }}/actions/workflows/awec-247.yml/dispatches \
-              -d '{"ref":"main"}'
-          else
-            echo "ℹ️ Հերթում արդեն կա սպասող աշխատանք։"
-          fi
