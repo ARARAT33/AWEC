@@ -1,4 +1,4 @@
-# ═══════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  AWEC – Matrix Spiders + Deduplicator + Dual Uploaders
 #  10 spider + 1 dedup-checker + 2 uploader = 13 jobs
 #  Zero data loss, zero duplicates, ultra-fast
@@ -39,7 +39,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2 pigz
 
       - name: Download latest release shards
         env:
@@ -153,7 +153,9 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
-      - run: pip install -q aiohttp pigz
+      - run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+          pip install -q aiohttp
 
       - uses: actions/download-artifact@v4
         with:
@@ -240,6 +242,9 @@ jobs:
           shard_index = os.environ['SHARD_INDEX']
           conn = sqlite3.connect(db_file)
           c = conn.cursor()
+          # Ապահովում ենք, որ աղյուսակը գոյություն ունենա սխալներից խուսափելու համար
+          c.execute('CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)')
+          conn.commit()
           c.execute('SELECT url FROM urls')
           with open(f'output/links_{shard_index}.txt', 'w') as f:
               while True:
@@ -273,6 +278,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
 
       - uses: actions/download-artifact@v4
         with:
@@ -312,6 +318,8 @@ jobs:
           # 3. Merge ALL spider DBs (PRIMARY KEY removes duplicates instantly)
           for db_path in spider_dbs:
               master.execute(f"ATTACH DATABASE '{db_path}' AS spider")
+              # Ապահովում ենք, որ յուրաքանչյուր կցվող բազա ունենա urls աղյուսակը
+              master.execute("CREATE TABLE IF NOT EXISTS spider.urls (url TEXT PRIMARY KEY)")
               master.execute("INSERT OR IGNORE INTO main.urls SELECT * FROM spider.urls")
               master.execute("DETACH DATABASE spider")
               print(f"➕ {os.path.basename(db_path)} merged")
@@ -381,6 +389,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
       - uses: actions/download-artifact@v4
         with:
           name: dedup-output
@@ -421,6 +430,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
       - uses: actions/download-artifact@v4
         with:
           name: dedup-output
