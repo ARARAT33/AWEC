@@ -4,89 +4,20 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
-
-concurrency:
-  group: awec_crawler_group
-  cancel-in-progress: false
 
 permissions:
   contents: write
 
 env:
   MATRIX_SIZE: 10
-  CRAWL_TIME_SEC: 19800
+  CRAWL_TIME_SEC: 19770
   MAX_DB_SIZE: 1900000000
   DEDUP_BATCH: 1000000
 
 jobs:
-  system-total-wipeout:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Report Disk Space Before Wipeout
-        run: |
-          echo "=== DISK SPACE BEFORE AGGRESSIVE CLEANING ==="
-          df -h
-          echo "============================================="
-
-      - name: Aggressive Real-Time Space Clearance
-        run: |
-          BEFORE_BYTES=$(df -B1 / | awk 'NR==2 {print $4}')
-          echo "🔥 Starting total system wipeout with real-time tracking..."
-
-          track_progress() {
-            local step_name=$1
-            local current_bytes=$(df -B1 / | awk 'NR==2 {print $4}')
-            local freed_bytes=$((current_bytes - BEFORE_BYTES))
-            if [ $freed_bytes -lt 0 ]; then freed_bytes=0; fi
-            local freed_gb=$(echo "scale=3; $freed_bytes / 1073741824" | bc)
-            echo "⚡ [Progress] After $step_name -> Total Freed: ${freed_gb} GB"
-          }
-
-          sudo rm -rf /usr/share/dotnet && track_progress "removing DotNet"
-          sudo rm -rf /usr/local/lib/android && track_progress "removing Android SDK"
-          sudo rm -rf /opt/ghc && track_progress "removing Haskell GHC"
-          sudo rm -rf /opt/hostedtoolcache && track_progress "removing Hosted Tool Cache"
-          sudo rm -rf /usr/share/swift && track_progress "removing Swift"
-          sudo rm -rf /usr/local/share/powershell && track_progress "removing PowerShell"
-          sudo rm -rf /etc/apt/sources.list.d/* && track_progress "clearing APT Sources"
-          docker rmi $(docker images -q) -f || true && track_progress "cleaning Docker Images"
-          sudo apt-get clean && track_progress "APT Clean"
-          sudo rm -rf /var/lib/apt/lists/* && track_progress "removing APT Lists"
-          
-          AFTER_BYTES=$(df -B1 / | awk 'NR==2 {print $4}')
-          TOTAL_BYTES=$(df -B1 / | awk 'NR==2 {print $2}')
-          
-          python3 -c "
-          before = $BEFORE_BYTES
-          after = $AFTER_BYTES
-          total = $TOTAL_BYTES
-          freed = max(0, after - before)
-          freed_gb = freed / 1073741824
-          after_gb = after / 1073741824
-          total_gb = total / 1073741824
-          percent_freed = (freed / total) * 100 if total > 0 else 0
-          
-          print('=============================================')
-          print(f'🧹 FINAL WIPEOUT METRICS:')
-          print(f'• Total Space Saved: {freed_gb:.3f} GB')
-          print(f'• Available Storage: {after_gb:.3f} GB / {total_gb:.3f} GB')
-          print(f'• Recovered Capacity: +{percent_freed:.2f}% of disk')
-          print('=============================================')
-          "
-
-      - name: Report Available Disk Space For Next Jobs
-        run: |
-          echo "=== FINAL AVAILABLE DISK SPACE ==="
-          AVAILABLE_GB=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
-          echo "TOTAL AVAILABLE SPACE: ${AVAILABLE_GB} GB"
-          df -h
-          echo "=================================="
-
   prepare-shards:
-    needs: system-total-wipeout
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -96,7 +27,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2 zstd
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2 pigz
 
       - name: Download latest release shards
         env:
@@ -196,6 +127,9 @@ jobs:
     needs: prepare-shards
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    concurrency:
+      group: awec_spiders_lock
+      cancel-in-progress: false
     strategy:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -207,7 +141,7 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
       - run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq zstd xz-utils
+          sudo apt-get update -qq && sudo apt-get install -y -qq pigz
           pip install -q aiohttp
 
       - uses: actions/download-artifact@v4
@@ -235,62 +169,42 @@ jobs:
 
       - name: Extract checkpoint
         run: |
-          if [ -f checkpoint.tar.xz ]; then
-            tar -xJf checkpoint.tar.xz
-            echo "🔄 Checkpoint restored via ultra-decompression"
-          elif [ -f checkpoint.tar.gz ]; then
+          if [ -f checkpoint.tar.gz ]; then
             tar -xzf checkpoint.tar.gz
-            echo "🔄 Legacy checkpoint restored"
+            echo "🔄 Checkpoint restored"
           else
             echo "ℹ️ Fresh start"
           fi
 
-      - name: 🕷️ Run Spider & Space Shield Monitor
+      - name: 🕷️ Run Spider
         id: spider
         env:
           DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
           SHARD_INDEX: ${{ matrix.shard }}
           TOTAL_SHARDS: ${{ env.MATRIX_SIZE }}
         run: |
-          (
-            while true; do
-              sleep 30
-              FREE_KB=$(df / | awk 'NR==2 {print $4}')
-              if [ "$FREE_KB" -lt 3000000 ]; then
-                echo "🚨 WARNING: Disk Space Critical! Active Emergency Backup to prevent data loss."
-                kill -INT $SPIDER_PID
-                break
-              fi
-            done
-          ) &
-          MONITOR_PID=$!
-
           python collector_247.py \
             --db "$DB_FILE" \
             --shard-index "$SHARD_INDEX" \
             --total-shards "$TOTAL_SHARDS" &
           SPIDER_PID=$!
-
           sleep $CRAWL_TIME_SEC &
           SLEEP_PID=$!
-          
           wait -n $SLEEP_PID $SPIDER_PID || true
-          
           if kill -0 $SPIDER_PID 2>/dev/null; then
-            echo "⏰ Limits reached or process interrupted – sending SIGINT"
+            echo "⏰ Limits reached – sending SIGINT"
             kill -INT $SPIDER_PID
             wait $SPIDER_PID 2>/dev/null || true
           fi
-          kill $MONITOR_PID 2>/dev/null || true
 
-      - name: 💾 Pack checkpoint (Ultra-Aggressive Compression xz -9e)
+      - name: 💾 Pack checkpoint on interruption
         if: cancelled() || failure()
         id: save_ckpt
         run: |
           if [ -d "checkpoints" ]; then
-            tar -cf - checkpoints | xz -9e > checkpoint.tar.xz
+            tar -czf checkpoint.tar.gz checkpoints
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
-            echo "💾 Checkpoint packed with XZ -9e (Max Density)"
+            echo "💾 Checkpoint packed"
           else
             echo "⚠️ No checkpoints dir found!"
           fi
@@ -299,7 +213,7 @@ jobs:
         if: always() && steps.save_ckpt.outputs.CHECKPOINT_READY == 'true'
         with:
           name: checkpoint-shard-${{ matrix.shard }}
-          path: checkpoint.tar.xz
+          path: checkpoint.tar.gz
           retention-days: 1
 
       - name: 📦 Prepare spider output (raw DB + txt)
@@ -326,13 +240,13 @@ jobs:
           conn.close()
           PYEOF
           cp "$DB_FILE" output/spider_$SHARD_INDEX.db
-          tar -cf - -C output . | zstd --ultra -22 -T0 > spider-output.tar.zst
+          tar -I pigz -cf spider-output.tar.gz -C output .
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: spider-output-shard-${{ matrix.shard }}
-          path: spider-output.tar.zst
+          path: spider-output.tar.gz
           retention-days: 1
 
   deduplicator:
@@ -341,36 +255,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      - name: Aggressive Space Clearance
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/powershell
+          docker rmi $(docker images -q) -f || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          df -h
+
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd xz-utils
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
 
       - uses: actions/download-artifact@v4
         with:
           pattern: 'spider-output-shard-*'
           path: all_spiders
 
-      - name: Merge and Deduplicate all spider DBs
+      - name: Stream Merge and Deduplicate
         run: |
           python3 << 'PYEOF'
-          import glob, subprocess, os
-          os.makedirs("extracted_spiders", exist_ok=True)
-          for f in glob.glob("all_spiders/**/*.tar.zst", recursive=True):
-              print(f"Extracting {f} with zstd...")
-              subprocess.run(["tar", "--use-compress-program=zstd", "-xf", f, "-C", "extracted_spiders"])
-          PYEOF
-
-          python3 << 'PYEOF'
-          import sqlite3, os, glob
-
-          spider_dbs = glob.glob("extracted_spiders/spider_*.db")
-          print(f"📊 Found {len(spider_dbs)} extracted spider databases")
-
-          if not spider_dbs:
-              print("❌ No spider DBs found!")
-              exit(1)
+          import glob, subprocess, os, sqlite3
 
           master = sqlite3.connect("master_links.db")
           master.execute("PRAGMA journal_mode=OFF")
@@ -380,15 +292,27 @@ jobs:
           master.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
           master.commit()
 
-          for db_path in spider_dbs:
-              master.execute(f"ATTACH DATABASE '{db_path}' AS spider")
-              master.execute("CREATE TABLE IF NOT EXISTS spider.urls (url TEXT PRIMARY KEY)")
-              master.execute("INSERT OR IGNORE INTO main.urls SELECT * FROM spider.urls")
-              master.execute("DETACH DATABASE spider")
-              print(f"➕ {os.path.basename(db_path)} merged")
+          archives = glob.glob("all_spiders/**/*.tar.gz", recursive=True)
+          print(f"📊 Found {len(archives)} archives to merge...")
+
+          for arch in archives:
+              os.makedirs("temp_extract", exist_ok=True)
+              print(f"Extracting {arch}...")
+              subprocess.run(["tar", "-I", "pigz", "-xf", arch, "-C", "temp_extract"])
+              
+              db_files = glob.glob("temp_extract/spider_*.db")
+              if db_files:
+                  db_path = db_files[0]
+                  master.execute(f"ATTACH DATABASE '{db_path}' AS spider")
+                  master.execute("CREATE TABLE IF NOT EXISTS spider.urls (url TEXT PRIMARY KEY)")
+                  master.execute("INSERT OR IGNORE INTO main.urls SELECT * FROM spider.urls")
+                  master.execute("DETACH DATABASE spider")
+                  print(f"➕ {os.path.basename(db_path)} merged")
+              
+              subprocess.run(["rm", "-rf", "temp_extract"])
 
           total = master.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
-          print(f"🎉 Master DB created: {total} UNIQUE URLs (duplicates removed)")
+          print(f"🎉 Master DB created: {total} UNIQUE URLs")
 
           with open("links.txt", "w", encoding="utf-8") as f:
               c = master.execute("SELECT url FROM urls")
@@ -396,7 +320,7 @@ jobs:
                   rows = c.fetchmany(1000000)
                   if not rows: break
                   f.writelines(row[0] + "\n" for row in rows)
-          print(f"✅ links.txt exported ({os.path.getsize('links.txt')} bytes)")
+          print(f"✅ links.txt exported")
 
           MAX_SIZE = int(os.environ.get("MAX_DB_SIZE", 1900000000))
           os.makedirs("final_shards", exist_ok=True)
@@ -429,14 +353,14 @@ jobs:
           master.close()
           PYEOF
 
-      - name: Package deduplicated output with Ultra-Aggressive XZ Compression (-9e)
+      - name: Package deduplicated output
         run: |
-          tar -cf - final_shards links.txt | xz -9e > dedup-output.tar.xz
+          tar -I pigz -cf dedup-output.tar.gz final_shards links.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: dedup-output
-          path: dedup-output.tar.xz
+          path: dedup-output.tar.gz
           retention-days: 1
 
   github-release-upload:
@@ -445,16 +369,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils split
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
       - uses: actions/download-artifact@v4
         with:
           name: dedup-output
           path: .
 
-      - name: Extract ultra-compressed archive
-        run: tar -xJf dedup-output.tar.xz
+      - name: Extract
+        run: tar -I pigz -xf dedup-output.tar.gz
 
-      - name: 🚀 Create GitHub Release & Segmented Upload (Max 2GB chunks)
+      - name: 🚀 Create GitHub Release & Upload
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
           TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
@@ -463,29 +387,18 @@ jobs:
           TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
           gh release create "$TAG" \
             --title "AWEC Run $(date +'%Y%m%d_%H%M%S')" \
-            --notes "${TOTAL} unique links collected (Ultra-Compressed)" \
+            --notes "${TOTAL} unique links collected" \
             --target main || echo "⚠️ Release exists"
 
           cd final_shards
           for f in links_part_*.db; do
-            if [ -f "$f" ]; then
-              FILE_SIZE=$(stat -c%s "$f")
-              if [ "$FILE_SIZE" -gt 2000000000 ]; then
-                echo "⚡ Splitting large file $f into chunks..."
-                split -b 1900M "$f" "${f}_part_"
-                for chunk in ${f}_part_*; do
-                  gh release upload "$TAG" "$chunk" --clobber &
-                done
-              else
-                gh release upload "$TAG" "$f" --clobber &
-              fi
-            fi
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --clobber &
           done
           if [ -f ../links.txt ]; then
             gh release upload "$TAG" ../links.txt --clobber &
           fi
           wait
-          echo "✅ GitHub Release complete with strict chunk control"
+          echo "✅ GitHub Release complete"
 
   internet-archive-upload:
     needs: deduplicator
@@ -493,16 +406,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
       - uses: actions/download-artifact@v4
         with:
           name: dedup-output
           path: .
 
-      - name: Extract ultra-compressed archive
-        run: tar -xJf dedup-output.tar.xz
+      - name: Extract
+        run: tar -I pigz -xf dedup-output.tar.gz
 
-      - name: 📤 Upload to Internet Archive (Unlimited Space Storage)
+      - name: 📤 Upload to Internet Archive
         env:
           IA_ACCESS_KEY: '${{ secrets.IA_ACCESS_KEY }}'
           IA_SECRET_KEY: '${{ secrets.IA_SECRET_KEY }}'
