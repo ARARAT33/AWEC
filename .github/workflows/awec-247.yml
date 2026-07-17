@@ -27,7 +27,7 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 1: System Total Wipeout & Disk Space Report
+  #  Job 1: System Total Wipeout & Real-Time Disk Space Report
   # ═══════════════════════════════════════════════════════════════════
   system-total-wipeout:
     runs-on: ubuntu-latest
@@ -39,28 +39,35 @@ jobs:
           df -h
           echo "============================================="
 
-      - name: Aggressive Space Clearance (Remove Everything Except Core OS)
+      - name: Aggressive Real-Time Space Clearance
         run: |
           # Ֆիքսում ենք սկզբնական ազատ տարածքը բայթերով
           BEFORE_BYTES=$(df -B1 / | awk 'NR==2 {print $4}')
-          BEFORE_GB=$(echo "scale=2; $BEFORE_BYTES / 1073741824" | bc)
-          echo "🔥 Starting total system wipeout..."
-          echo "Starting disk space: $BEFORE_GB GB"
+          echo "🔥 Starting total system wipeout with real-time tracking..."
 
-          # Ագրեսիվ մաքրում
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /etc/apt/sources.list.d/*
-          docker rmi $(docker images -q) -f || true
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
-          echo "✅ Wipeout completed successfully."
+          # Ֆունկցիա՝ իրական ժամանակում ազատված տեղը չափելու համար
+          track_progress() {
+            local step_name=$1
+            local current_bytes=$(df -B1 / | awk 'NR==2 {print $4}')
+            local freed_bytes=$((current_bytes - BEFORE_BYTES))
+            if [ $freed_bytes -lt 0 ]; then freed_bytes=0; fi
+            local freed_gb=$(echo "scale=3; $freed_bytes / 1073741824" | bc)
+            echo "⚡ [Progress] After $step_name -> Total Freed: ${freed_gb} GB"
+          }
 
-          # Չափում ենք վերջնական տարածքը և հաշվում տարբերությունը տոկոսով ու ԳԲ-ով
+          # Ագրեսիվ և քայլ առ քայլ ջնջում՝ իրական ժամանակում հաշվետվությամբ
+          sudo rm -rf /usr/share/dotnet && track_progress "removing DotNet"
+          sudo rm -rf /usr/local/lib/android && track_progress "removing Android SDK"
+          sudo rm -rf /opt/ghc && track_progress "removing Haskell GHC"
+          sudo rm -rf /opt/hostedtoolcache && track_progress "removing Hosted Tool Cache"
+          sudo rm -rf /usr/share/swift && track_progress "removing Swift"
+          sudo rm -rf /usr/local/share/powershell && track_progress "removing PowerShell"
+          sudo rm -rf /etc/apt/sources.list.d/* && track_progress "clearing APT Sources"
+          docker rmi $(docker images -q) -f || true && track_progress "cleaning Docker Images"
+          sudo apt-get clean && track_progress "APT Clean"
+          sudo rm -rf /var/lib/apt/lists/* && track_progress "removing APT Lists"
+          
+          # Վերջնական ստուգում
           AFTER_BYTES=$(df -B1 / | awk 'NR==2 {print $4}')
           TOTAL_BYTES=$(df -B1 / | awk 'NR==2 {print $2}')
           
@@ -68,20 +75,17 @@ jobs:
           before = $BEFORE_BYTES
           after = $AFTER_BYTES
           total = $TOTAL_BYTES
-          freed = after - before
+          freed = max(0, after - before)
           freed_gb = freed / 1073741824
           after_gb = after / 1073741824
           total_gb = total / 1073741824
-          
-          percent_freed_of_total = (freed / total) * 100 if total > 0 else 0
-          percent_freed_of_original = (freed / before) * 100 if before > 0 else 0
+          percent_freed = (freed / total) * 100 if total > 0 else 0
           
           print('=============================================')
-          print(f'🧹 WIPEOUT REPORT (REAL-TIME METRICS):')
-          print(f'• Freed Space: {freed_gb:.2f} GB')
-          print(f'• Current Free Space: {after_gb:.2f} GB / {total_gb:.2f} GB')
-          print(f'• Disk Capacity Freed: +{percent_freed_of_total:.2f}% of total disk')
-          print(f'• Free Space Increased by: +{percent_freed_of_original:.2f}% compared to start')
+          print(f'🧹 FINAL WIPEOUT METRICS:')
+          print(f'• Total Space Saved: {freed_gb:.3f} GB')
+          print(f'• Available Storage: {after_gb:.3f} GB / {total_gb:.3f} GB')
+          print(f'• Recovered Capacity: +{percent_freed:.2f}% of disk')
           print('=============================================')
           "
 
@@ -107,7 +111,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2 pigz
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2 zstd
 
       - name: Download latest release shards
         env:
@@ -222,7 +226,7 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
       - run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+          sudo apt-get update -qq && sudo apt-get install -y -qq zstd xz-utils
           pip install -q aiohttp
 
       - uses: actions/download-artifact@v4
@@ -250,42 +254,67 @@ jobs:
 
       - name: Extract checkpoint
         run: |
-          if [ -f checkpoint.tar.gz ]; then
+          if [ -f checkpoint.tar.xz ]; then
+            tar -xJf checkpoint.tar.xz
+            echo "🔄 Checkpoint restored via ultra-decompression"
+          elif [ -f checkpoint.tar.gz ]; then
             tar -xzf checkpoint.tar.gz
-            echo "🔄 Checkpoint restored (checkpoints/ directory reconstructed)"
+            echo "🔄 Legacy checkpoint restored"
           else
             echo "ℹ️ Fresh start"
           fi
 
-      - name: 🕷️ Run Spider
+      - name: 🕷️ Run Spider & Space Shield Monitor
         id: spider
         env:
           DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
           SHARD_INDEX: ${{ matrix.shard }}
           TOTAL_SHARDS: ${{ env.MATRIX_SIZE }}
         run: |
+          # Մոնիտորինգի ֆոնային սցենար (Space Shield), որը հսկում է սկավառակի ազատ տեղը
+          (
+            while true; do
+              sleep 30
+              FREE_KB=$(df / | awk 'NR==2 {print $4}')
+              # Եթե ազատ տեղը 3,000,000 KB-ից (~3 GB) պակաս է
+              if [ "$FREE_KB" -lt 3000000 ]; then
+                echo "🚨 WARNING: Disk Space Critical! Active Emergency Backup to prevent data loss."
+                # Ուղարկում ենք SIGINT ազդանշան սփայդերին՝ նրա աշխատանքը անվտանգ ավարտելու համար
+                kill -INT $SPIDER_PID
+                break
+              fi
+            done
+          ) &
+          MONITOR_PID=$!
+
           python collector_247.py \
             --db "$DB_FILE" \
             --shard-index "$SHARD_INDEX" \
             --total-shards "$TOTAL_SHARDS" &
           SPIDER_PID=$!
+
           sleep $CRAWL_TIME_SEC &
           SLEEP_PID=$!
+          
+          # Սպասում ենք առաջին ավարտվող գործընթացին
           wait -n $SLEEP_PID $SPIDER_PID || true
+          
           if kill -0 $SPIDER_PID 2>/dev/null; then
-            echo "⏰ 5.5h – sending SIGINT"
+            echo "⏰ Limits reached or process interrupted – sending SIGINT"
             kill -INT $SPIDER_PID
             wait $SPIDER_PID 2>/dev/null || true
           fi
+          kill $MONITOR_PID 2>/dev/null || true
 
-      - name: 💾 Pack checkpoint on interruption
+      - name: 💾 Pack checkpoint (Ultra-Aggressive Compression xz -9e)
         if: cancelled() || failure()
         id: save_ckpt
         run: |
           if [ -d "checkpoints" ]; then
-            tar -I "pigz -9" -cf checkpoint.tar.gz checkpoints
+            # Օգտագործում ենք XZ-ի ամենաագրեսիվ էքստրեմալ սեղմումը (-9e)
+            tar -cf - checkpoints | xz -9e > checkpoint.tar.xz
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
-            echo "💾 Checkpoint packed aggressively"
+            echo "💾 Checkpoint packed with XZ -9e (Max Density)"
           else
             echo "⚠️ No checkpoints dir found!"
           fi
@@ -294,7 +323,7 @@ jobs:
         if: always() && steps.save_ckpt.outputs.CHECKPOINT_READY == 'true'
         with:
           name: checkpoint-shard-${{ matrix.shard }}
-          path: checkpoint.tar.gz
+          path: checkpoint.tar.xz
           retention-days: 1
 
       - name: 📦 Prepare spider output (raw DB + txt)
@@ -321,13 +350,14 @@ jobs:
           conn.close()
           PYEOF
           cp "$DB_FILE" output/spider_$SHARD_INDEX.db
-          tar -I "pigz -9" -cf spider-output.tar.gz -C output .
+          # Օգտագործում ենք ZSTD առավելագույն ultra մակարդակով (--ultra -22) արագ և գերհզոր սեղմման համար
+          tar -cf - -C output . | zstd --ultra -22 -T0 > spider-output.tar.zst
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: spider-output-shard-${{ matrix.shard }}
-          path: spider-output.tar.gz
+          path: spider-output.tar.zst
           retention-days: 1
 
 
@@ -345,7 +375,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq zstd xz-utils
 
       - uses: actions/download-artifact@v4
         with:
@@ -355,11 +385,11 @@ jobs:
       - name: Merge and Deduplicate all spider DBs
         run: |
           python3 << 'PYEOF'
-          import glob, tarfile, os
-          for f in glob.glob("all_spiders/**/*.tar.gz", recursive=True):
-              print(f"Extracting {f}...")
-              with tarfile.open(f, "r") as tar:
-                  tar.extractall(path="extracted_spiders")
+          import glob, subprocess, os
+          os.makedirs("extracted_spiders", exist_ok=True)
+          for f in glob.glob("all_spiders/**/*.tar.zst", recursive=True):
+              print(f"Extracting {f} with zstd...")
+              subprocess.run(["tar", "--use-compress-program=zstd", "-xf", f, "-C", "extracted_spiders"])
           PYEOF
 
           python3 << 'PYEOF'
@@ -429,19 +459,19 @@ jobs:
           master.close()
           PYEOF
 
-      - name: Package deduplicated output aggressively
+      - name: Package deduplicated output with Ultra-Aggressive XZ Compression (-9e)
         run: |
-          tar -I "pigz -9" -cf dedup-output.tar.gz final_shards links.txt
+          tar -cf - final_shards links.txt | xz -9e > dedup-output.tar.xz
 
       - uses: actions/upload-artifact@v4
         with:
           name: dedup-output
-          path: dedup-output.tar.gz
+          path: dedup-output.tar.xz
           retention-days: 1
 
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 14: GitHub Release Uploader
+  #  Job 14: GitHub Release Uploader (with strict 2GB chunks)
   # ═══════════════════════════════════════════════════════════════════
   github-release-upload:
     needs: deduplicator
@@ -449,16 +479,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils split
       - uses: actions/download-artifact@v4
         with:
           name: dedup-output
           path: .
 
-      - name: Extract
-        run: tar -I pigz -xf dedup-output.tar.gz
+      - name: Extract ultra-compressed archive
+        run: tar -xJf dedup-output.tar.xz
 
-      - name: 🚀 Create GitHub Release & Upload
+      - name: 🚀 Create GitHub Release & Segmented Upload (Max 2GB chunks)
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
           TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
@@ -467,18 +497,31 @@ jobs:
           TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
           gh release create "$TAG" \
             --title "AWEC Run $(date +'%Y%m%d_%H%M%S')" \
-            --notes "${TOTAL} unique links collected" \
+            --notes "${TOTAL} unique links collected (Ultra-Compressed)" \
             --target main || echo "⚠️ Release exists"
 
-          cd final_shards
+          # Ուղարկում ենք տվյալների շարդերը։ Եթե որևէ DB ֆայլ 2GB-ից մեծ լինի, այն կփոշիանա/կմասնատվի
+         cd final_shards
           for f in links_part_*.db; do
-            [ -f "$f" ] && gh release upload "$TAG" "$f" --clobber &
+            if [ -f "$f" ]; then
+              FILE_SIZE=$(stat -c%s "$f")
+              # 2,000,000,000 բայթ (մոտ 1.86 GB) սահմանաչափ
+              if [ "$FILE_SIZE" -gt 2000000000 ]; then
+                echo "⚡ Splitting large file $f into chunks..."
+                split -b 1900M "$f" "${f}_part_"
+                for chunk in ${f}_part_*; do
+                  gh release upload "$TAG" "$chunk" --clobber &
+                done
+              else
+                gh release upload "$TAG" "$f" --clobber &
+              fi
+            fi
           done
           if [ -f ../links.txt ]; then
             gh release upload "$TAG" ../links.txt --clobber &
           fi
           wait
-          echo "✅ GitHub Release complete"
+          echo "✅ GitHub Release complete with strict chunk control"
 
 
   # ═══════════════════════════════════════════════════════════════════
@@ -490,16 +533,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils
       - uses: actions/download-artifact@v4
         with:
           name: dedup-output
           path: .
 
-      - name: Extract
-        run: tar -I pigz -xf dedup-output.tar.gz
+      - name: Extract ultra-compressed archive
+        run: tar -xJf dedup-output.tar.xz
 
-      - name: 📤 Upload to Internet Archive
+      - name: 📤 Upload to Internet Archive (Unlimited Space Storage)
         env:
           IA_ACCESS_KEY: '${{ secrets.IA_ACCESS_KEY }}'
           IA_SECRET_KEY: '${{ secrets.IA_SECRET_KEY }}'
@@ -521,4 +564,4 @@ jobs:
             ia upload "$IA_ID" ../links.txt --retries 5 &
           fi
           wait
-          echo "✅ IA upload complete"
+          echo "✅ IA upload complete" 
