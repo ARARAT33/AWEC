@@ -41,7 +41,13 @@ jobs:
 
       - name: Aggressive Space Clearance (Remove Everything Except Core OS)
         run: |
+          # Ֆիքսում ենք սկզբնական ազատ տարածքը բայթերով
+          BEFORE_BYTES=$(df -B1 / | awk 'NR==2 {print $4}')
+          BEFORE_GB=$(echo "scale=2; $BEFORE_BYTES / 1073741824" | bc)
           echo "🔥 Starting total system wipeout..."
+          echo "Starting disk space: $BEFORE_GB GB"
+
+          # Ագրեսիվ մաքրում
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
@@ -53,6 +59,31 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
           echo "✅ Wipeout completed successfully."
+
+          # Չափում ենք վերջնական տարածքը և հաշվում տարբերությունը տոկոսով ու ԳԲ-ով
+          AFTER_BYTES=$(df -B1 / | awk 'NR==2 {print $4}')
+          TOTAL_BYTES=$(df -B1 / | awk 'NR==2 {print $2}')
+          
+          python3 -c "
+          before = $BEFORE_BYTES
+          after = $AFTER_BYTES
+          total = $TOTAL_BYTES
+          freed = after - before
+          freed_gb = freed / 1073741824
+          after_gb = after / 1073741824
+          total_gb = total / 1073741824
+          
+          percent_freed_of_total = (freed / total) * 100 if total > 0 else 0
+          percent_freed_of_original = (freed / before) * 100 if before > 0 else 0
+          
+          print('=============================================')
+          print(f'🧹 WIPEOUT REPORT (REAL-TIME METRICS):')
+          print(f'• Freed Space: {freed_gb:.2f} GB')
+          print(f'• Current Free Space: {after_gb:.2f} GB / {total_gb:.2f} GB')
+          print(f'• Disk Capacity Freed: +{percent_freed_of_total:.2f}% of total disk')
+          print(f'• Free Space Increased by: +{percent_freed_of_original:.2f}% compared to start')
+          print('=============================================')
+          "
 
       - name: Report Available Disk Space For Next Jobs
         run: |
