@@ -4,7 +4,7 @@ RE_URL = re.compile(r'(?:https?|ftp|magnet|ipfs)://[^\s<>"\'{}|\\^`\[\]]+|'
                     r'\b[a-z2-7]{16,56}\.onion\b|magnet:\?[^\s]+', re.I)
 
 body = os.getenv("ISSUE_BODY", "")
-conn = sqlite3.connect("links.db")
+conn = sqlite3.connect("links.db", timeout=30)
 conn.execute("CREATE TABLE IF NOT EXISTS links (url TEXT PRIMARY KEY, added TEXT)")
 
 links = set(RE_URL.findall(body))
@@ -15,8 +15,8 @@ for url in links:
         conn.execute("INSERT OR IGNORE INTO links(url,added) VALUES(?,?)", (url.strip(), now))
         if conn.total_changes > 0:
             new += 1
-    except:
-        pass
+    except sqlite3.OperationalError as e:
+        print(f"⚠️ SQLite error: {e}")
 conn.commit()
 conn.close()
 print(f"Added {new} links from issue.")

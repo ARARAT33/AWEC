@@ -115,7 +115,7 @@ class ContinuousHarvester:
 
     # ── Database ──────────────────────────────────────────
     def init_db(self) -> None:
-        self.db_conn = sqlite3.connect(self.db_path)
+        self.db_conn = sqlite3.connect(self.db_path, timeout=30)
         self.db_conn.execute("PRAGMA journal_mode=TRUNCATE")
         self.db_conn.execute("PRAGMA synchronous=NORMAL")
         self.db_conn.execute("PRAGMA cache_size=-500000")
@@ -156,9 +156,12 @@ class ContinuousHarvester:
         # DB copy
         if copy_db:
             try:
-                # Ensure DB is committed
+                CHECKPOINT_DIR.mkdir(exist_ok=True)
+                dest = CHECKPOINT_DIR / CHECKPOINT_DB_COPY
                 self.db_conn.commit()
-                shutil.copy2(self.db_path, CHECKPOINT_DIR / CHECKPOINT_DB_COPY)
+                backup = sqlite3.connect(str(dest), timeout=30)
+                self.db_conn.backup(backup)
+                backup.close()
                 log(f"💾 Checkpoint written (DB + JSON) – queue {len(self.active_pool)}")
             except Exception as e:
                 log(f"⚠️ Failed to copy DB for checkpoint: {e}")
@@ -170,9 +173,9 @@ class ContinuousHarvester:
         db_copy = CHECKPOINT_DIR / CHECKPOINT_DB_COPY
         if json_path.exists() and db_copy.exists():
             try:
-                # Restore DB
+                if self.db_conn:
+                    self.db_conn.close()
                 shutil.copy2(db_copy, self.db_path)
-                self.db_conn.close()
                 self.init_db()
                 with open(json_path, "r", encoding="utf-8") as f:
                     state = json.load(f)
