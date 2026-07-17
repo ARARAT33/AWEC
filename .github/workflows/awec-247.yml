@@ -128,7 +128,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     concurrency:
-      group: awec_spiders_lock
+      group: awec_spiders_lock_shard_${{ matrix.shard }}
       cancel-in-progress: false
     strategy:
       matrix:
