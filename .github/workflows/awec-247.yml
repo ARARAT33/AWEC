@@ -64,15 +64,15 @@ jobs:
                   for f in glob.glob(os.path.join(d, "**", "*.db"), recursive=True):
                       files.append(f)
           if not files:
-              conn = sqlite3.connect("links.db")
+              conn = sqlite3.connect("links.db", timeout=30)
               conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
               conn.commit(); conn.close()
               print("ℹ️ Empty DB created")
               exit(0)
-          tmp = sqlite3.connect(files[0])
+          tmp = sqlite3.connect(files[0], timeout=30)
           schema = tmp.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='urls'").fetchone()[0]
           tmp.close()
-          main = sqlite3.connect("links.db")
+          main = sqlite3.connect("links.db", timeout=30)
           main.execute("PRAGMA journal_mode=OFF"); main.execute("PRAGMA synchronous=OFF")
           main.execute("PRAGMA cache_size=-2000000"); main.execute(schema); main.commit()
           for f in files:
@@ -90,13 +90,13 @@ jobs:
           import sqlite3, os, hashlib
           SRC = "links.db"; N = int(os.environ["MATRIX_SIZE"])
           os.makedirs("initial_shards", exist_ok=True)
-          src = sqlite3.connect(SRC); c = src.cursor()
+          src = sqlite3.connect(SRC, timeout=30); c = src.cursor()
           c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='urls'")
           schema = c.fetchone()[0]
           conns = []
           for i in range(N):
               name = f"initial_shards/initial_shard_{i:04d}.db"
-              conn = sqlite3.connect(name)
+              conn = sqlite3.connect(name, timeout=30)
               conn.execute("PRAGMA synchronous=OFF"); conn.execute("PRAGMA journal_mode=OFF")
               conn.execute(schema); conns.append(conn)
           c.execute("SELECT url FROM urls"); count = 0
@@ -227,7 +227,7 @@ jobs:
           import sqlite3, os
           db_file = os.environ['DB_FILE']
           shard_index = os.environ['SHARD_INDEX']
-          conn = sqlite3.connect(db_file)
+          conn = sqlite3.connect(db_file, timeout=30)
           c = conn.cursor()
           c.execute('CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)')
           conn.commit()
@@ -284,7 +284,7 @@ jobs:
           python3 << 'PYEOF'
           import glob, subprocess, os, sqlite3
 
-          master = sqlite3.connect("master_links.db")
+          master = sqlite3.connect("master_links.db", timeout=30)
           master.execute("PRAGMA journal_mode=OFF")
           master.execute("PRAGMA synchronous=OFF")
           master.execute("PRAGMA cache_size=-4000000")
@@ -296,6 +296,8 @@ jobs:
           print(f"📊 Found {len(archives)} archives to merge...")
 
           for arch in archives:
+              import shutil
+              shutil.rmtree("temp_extract", ignore_errors=True)
               os.makedirs("temp_extract", exist_ok=True)
               print(f"Extracting {arch}...")
               subprocess.run(["tar", "-I", "pigz", "-xf", arch, "-C", "temp_extract"])
@@ -309,7 +311,7 @@ jobs:
                   master.execute("DETACH DATABASE spider")
                   print(f"➕ {os.path.basename(db_path)} merged")
               
-              subprocess.run(["rm", "-rf", "temp_extract"])
+              shutil.rmtree("temp_extract", ignore_errors=True)
 
           total = master.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
           print(f"🎉 Master DB created: {total} UNIQUE URLs")
@@ -327,7 +329,7 @@ jobs:
           last = 0; idx = 1; total_split = 0
           while True:
               name = f"final_shards/links_part_{idx:04d}.db"
-              shard = sqlite3.connect(name)
+              shard = sqlite3.connect(name, timeout=30)
               shard.execute("PRAGMA synchronous=OFF"); shard.execute("PRAGMA journal_mode=OFF")
               shard.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
               rows = 0
