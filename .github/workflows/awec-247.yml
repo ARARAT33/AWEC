@@ -1,8 +1,3 @@
-# ═══════════════════════════════════════════════════════════════════
-#  AWEC – Matrix Spiders + Deduplicator + Dual Uploaders
-#  1 wipeout + 10 spider + 1 dedup + 2 uploader = 14 jobs
-#  Zero data loss, zero duplicates, ultra-fast, maximum disk space
-# ═══════════════════════════════════════════════════════════════════
 name: AWEC – 13-Job Matrix Spiders
 
 on:
@@ -21,14 +16,11 @@ permissions:
 
 env:
   MATRIX_SIZE: 10
-  CRAWL_TIME_SEC: 19800              # 5.5 ժամ (330 րոպե)
-  MAX_DB_SIZE: 1900000000            # 1.9 GB
-  DEDUP_BATCH: 1000000               # 1M տող յուրաքանչյուր batch-ում
+  CRAWL_TIME_SEC: 19800
+  MAX_DB_SIZE: 1900000000
+  DEDUP_BATCH: 1000000
 
 jobs:
-  # ═══════════════════════════════════════════════════════════════════
-  #  Job 1: System Total Wipeout & Real-Time Disk Space Report
-  # ═══════════════════════════════════════════════════════════════════
   system-total-wipeout:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -41,11 +33,9 @@ jobs:
 
       - name: Aggressive Real-Time Space Clearance
         run: |
-          # Ֆիքսում ենք սկզբնական ազատ տարածքը բայթերով
           BEFORE_BYTES=$(df -B1 / | awk 'NR==2 {print $4}')
           echo "🔥 Starting total system wipeout with real-time tracking..."
 
-          # Ֆունկցիա՝ իրական ժամանակում ազատված տեղը չափելու համար
           track_progress() {
             local step_name=$1
             local current_bytes=$(df -B1 / | awk 'NR==2 {print $4}')
@@ -55,7 +45,6 @@ jobs:
             echo "⚡ [Progress] After $step_name -> Total Freed: ${freed_gb} GB"
           }
 
-          # Ագրեսիվ և քայլ առ քայլ ջնջում՝ իրական ժամանակում հաշվետվությամբ
           sudo rm -rf /usr/share/dotnet && track_progress "removing DotNet"
           sudo rm -rf /usr/local/lib/android && track_progress "removing Android SDK"
           sudo rm -rf /opt/ghc && track_progress "removing Haskell GHC"
@@ -67,7 +56,6 @@ jobs:
           sudo apt-get clean && track_progress "APT Clean"
           sudo rm -rf /var/lib/apt/lists/* && track_progress "removing APT Lists"
           
-          # Վերջնական ստուգում
           AFTER_BYTES=$(df -B1 / | awk 'NR==2 {print $4}')
           TOTAL_BYTES=$(df -B1 / | awk 'NR==2 {print $2}')
           
@@ -97,9 +85,6 @@ jobs:
           df -h
           echo "=================================="
 
-  # ═══════════════════════════════════════════════════════════════════
-  #  Job 2: Prepare initial shards (merges previous + recovery)
-  # ═══════════════════════════════════════════════════════════════════
   prepare-shards:
     needs: system-total-wipeout
     runs-on: ubuntu-latest
@@ -207,10 +192,6 @@ jobs:
           TOTAL=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo 0)
           echo "TOTAL_OLD=$TOTAL" >> $GITHUB_OUTPUT
 
-
-  # ═══════════════════════════════════════════════════════════════════
-  #  Jobs 3‑12: Spider Matrix (10 parallel workers)
-  # ═══════════════════════════════════════════════════════════════════
   spider-matrix:
     needs: prepare-shards
     runs-on: ubuntu-latest
@@ -271,15 +252,12 @@ jobs:
           SHARD_INDEX: ${{ matrix.shard }}
           TOTAL_SHARDS: ${{ env.MATRIX_SIZE }}
         run: |
-          # Մոնիտորինգի ֆոնային սցենար (Space Shield), որը հսկում է սկավառակի ազատ տեղը
           (
             while true; do
               sleep 30
               FREE_KB=$(df / | awk 'NR==2 {print $4}')
-              # Եթե ազատ տեղը 3,000,000 KB-ից (~3 GB) պակաս է
               if [ "$FREE_KB" -lt 3000000 ]; then
                 echo "🚨 WARNING: Disk Space Critical! Active Emergency Backup to prevent data loss."
-                # Ուղարկում ենք SIGINT ազդանշան սփայդերին՝ նրա աշխատանքը անվտանգ ավարտելու համար
                 kill -INT $SPIDER_PID
                 break
               fi
@@ -296,7 +274,6 @@ jobs:
           sleep $CRAWL_TIME_SEC &
           SLEEP_PID=$!
           
-          # Սպասում ենք առաջին ավարտվող գործընթացին
           wait -n $SLEEP_PID $SPIDER_PID || true
           
           if kill -0 $SPIDER_PID 2>/dev/null; then
@@ -311,7 +288,6 @@ jobs:
         id: save_ckpt
         run: |
           if [ -d "checkpoints" ]; then
-            # Օգտագործում ենք XZ-ի ամենաագրեսիվ էքստրեմալ սեղմումը (-9e)
             tar -cf - checkpoints | xz -9e > checkpoint.tar.xz
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
             echo "💾 Checkpoint packed with XZ -9e (Max Density)"
@@ -350,7 +326,6 @@ jobs:
           conn.close()
           PYEOF
           cp "$DB_FILE" output/spider_$SHARD_INDEX.db
-          # Օգտագործում ենք ZSTD առավելագույն ultra մակարդակով (--ultra -22) արագ և գերհզոր սեղմման համար
           tar -cf - -C output . | zstd --ultra -22 -T0 > spider-output.tar.zst
 
       - uses: actions/upload-artifact@v4
@@ -360,11 +335,6 @@ jobs:
           path: spider-output.tar.zst
           retention-days: 1
 
-
-  # ═══════════════════════════════════════════════════════════════════
-  #  Job 13: Deduplicator – merges 10 spider outputs,
-  #          removes ALL duplicates, splits into final shards
-  # ═══════════════════════════════════════════════════════════════════
   deduplicator:
     needs: spider-matrix
     if: always() && !cancelled()
@@ -469,10 +439,6 @@ jobs:
           path: dedup-output.tar.xz
           retention-days: 1
 
-
-  # ═══════════════════════════════════════════════════════════════════
-  #  Job 14: GitHub Release Uploader (with strict 2GB chunks)
-  # ═══════════════════════════════════════════════════════════════════
   github-release-upload:
     needs: deduplicator
     if: always() && !cancelled()
@@ -484,7 +450,8 @@ jobs:
         with:
           name: dedup-output
           path: .
-    - name: Extract ultra-compressed archive
+
+      - name: Extract ultra-compressed archive
         run: tar -xJf dedup-output.tar.xz
 
       - name: 🚀 Create GitHub Release & Segmented Upload (Max 2GB chunks)
@@ -499,12 +466,10 @@ jobs:
             --notes "${TOTAL} unique links collected (Ultra-Compressed)" \
             --target main || echo "⚠️ Release exists"
 
-          # Ուղարկում ենք տվյալների շարդերը։ Եթե որևէ DB ֆայլ 2GB-ից մեծ լինի, այն կփոշիանա/կմասնատվի
           cd final_shards
           for f in links_part_*.db; do
             if [ -f "$f" ]; then
               FILE_SIZE=$(stat -c%s "$f")
-              # 2,000,000,000 բայթ (մոտ 1.86 GB) սահմանաչափ
               if [ "$FILE_SIZE" -gt 2000000000 ]; then
                 echo "⚡ Splitting large file $f into chunks..."
                 split -b 1900M "$f" "${f}_part_"
@@ -521,3 +486,42 @@ jobs:
           fi
           wait
           echo "✅ GitHub Release complete with strict chunk control"
+
+  internet-archive-upload:
+    needs: deduplicator
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq xz-utils
+      - uses: actions/download-artifact@v4
+        with:
+          name: dedup-output
+          path: .
+
+      - name: Extract ultra-compressed archive
+        run: tar -xJf dedup-output.tar.xz
+
+      - name: 📤 Upload to Internet Archive (Unlimited Space Storage)
+        env:
+          IA_ACCESS_KEY: '${{ secrets.IA_ACCESS_KEY }}'
+          IA_SECRET_KEY: '${{ secrets.IA_SECRET_KEY }}'
+          IA_ID: 'awec_links_${{ github.run_id }}_${{ github.run_attempt }}'
+        run: |
+          pip install -q internetarchive
+          mkdir -p ~/.config
+          cat << EOF > ~/.config/ia.ini
+          [s3]
+          access = $IA_ACCESS_KEY
+          secret = $IA_SECRET_KEY
+          EOF
+
+          cd final_shards
+          for f in links_part_*.db; do
+            [ -f "$f" ] && ia upload "$IA_ID" "$f" --retries 5 &
+          done
+          if [ -f ../links.txt ]; then
+            ia upload "$IA_ID" ../links.txt --retries 5 &
+          fi
+          wait
+          echo "✅ IA upload complete"
