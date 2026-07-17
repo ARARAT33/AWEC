@@ -1,7 +1,7 @@
 # ═══════════════════════════════════════════════════════════════════
 #  AWEC – Matrix Spiders + Deduplicator + Dual Uploaders
-#  10 spider + 1 dedup-checker + 2 uploader = 13 jobs
-#  Zero data loss, zero duplicates, ultra-fast
+#  1 wipeout + 10 spider + 1 dedup + 2 uploader = 14 jobs
+#  Zero data loss, zero duplicates, ultra-fast, maximum disk space
 # ═══════════════════════════════════════════════════════════════════
 name: AWEC – 13-Job Matrix Spiders
 
@@ -27,9 +27,46 @@ env:
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 1: Prepare initial shards (merges previous + recovery)
+  #  Job 1: System Total Wipeout & Disk Space Report
+  # ═══════════════════════════════════════════════════════════════════
+  system-total-wipeout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Report Disk Space Before Wipeout
+        run: |
+          echo "=== DISK SPACE BEFORE AGGRESSIVE CLEANING ==="
+          df -h
+          echo "============================================="
+
+      - name: Aggressive Space Clearance (Remove Everything Except Core OS)
+        run: |
+          echo "🔥 Starting total system wipeout..."
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /etc/apt/sources.list.d/*
+          docker rmi $(docker images -q) -f || true
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          echo "✅ Wipeout completed successfully."
+
+      - name: Report Available Disk Space For Next Jobs
+        run: |
+          echo "=== FINAL AVAILABLE DISK SPACE ==="
+          AVAILABLE_GB=$(df -BG / | awk 'NR==2 {print $4}' | sed 's/G//')
+          echo "TOTAL AVAILABLE SPACE: ${AVAILABLE_GB} GB"
+          df -h
+          echo "=================================="
+
+  # ═══════════════════════════════════════════════════════════════════
+  #  Job 2: Prepare initial shards (merges previous + recovery)
   # ═══════════════════════════════════════════════════════════════════
   prepare-shards:
+    needs: system-total-wipeout
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
@@ -137,7 +174,7 @@ jobs:
 
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Jobs 2‑11: Spider Matrix (10 parallel workers)
+  #  Jobs 3‑12: Spider Matrix (10 parallel workers)
   # ═══════════════════════════════════════════════════════════════════
   spider-matrix:
     needs: prepare-shards
@@ -215,9 +252,9 @@ jobs:
         id: save_ckpt
         run: |
           if [ -d "checkpoints" ]; then
-            tar -czf checkpoint.tar.gz checkpoints
+            tar -I "pigz -9" -cf checkpoint.tar.gz checkpoints
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
-            echo "💾 Checkpoint packed"
+            echo "💾 Checkpoint packed aggressively"
           else
             echo "⚠️ No checkpoints dir found!"
           fi
@@ -242,7 +279,6 @@ jobs:
           shard_index = os.environ['SHARD_INDEX']
           conn = sqlite3.connect(db_file)
           c = conn.cursor()
-          # Ապահովում ենք, որ աղյուսակը գոյություն ունենա սխալներից խուսափելու համար
           c.execute('CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)')
           conn.commit()
           c.execute('SELECT url FROM urls')
@@ -254,7 +290,7 @@ jobs:
           conn.close()
           PYEOF
           cp "$DB_FILE" output/spider_$SHARD_INDEX.db
-          tar -I pigz -cf spider-output.tar.gz -C output .
+          tar -I "pigz -9" -cf spider-output.tar.gz -C output .
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -265,7 +301,7 @@ jobs:
 
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 11: Deduplicator – merges 10 spider outputs,
+  #  Job 13: Deduplicator – merges 10 spider outputs,
   #          removes ALL duplicates, splits into final shards
   # ═══════════════════════════════════════════════════════════════════
   deduplicator:
@@ -298,7 +334,6 @@ jobs:
           python3 << 'PYEOF'
           import sqlite3, os, glob
 
-          # 1. Gather all extracted spider DBs
           spider_dbs = glob.glob("extracted_spiders/spider_*.db")
           print(f"📊 Found {len(spider_dbs)} extracted spider databases")
 
@@ -306,7 +341,6 @@ jobs:
               print("❌ No spider DBs found!")
               exit(1)
 
-          # 2. Create master DB
           master = sqlite3.connect("master_links.db")
           master.execute("PRAGMA journal_mode=OFF")
           master.execute("PRAGMA synchronous=OFF")
@@ -315,20 +349,16 @@ jobs:
           master.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
           master.commit()
 
-          # 3. Merge ALL spider DBs (PRIMARY KEY removes duplicates instantly)
           for db_path in spider_dbs:
               master.execute(f"ATTACH DATABASE '{db_path}' AS spider")
-              # Ապահովում ենք, որ յուրաքանչյուր կցվող բազա ունենա urls աղյուսակը
               master.execute("CREATE TABLE IF NOT EXISTS spider.urls (url TEXT PRIMARY KEY)")
               master.execute("INSERT OR IGNORE INTO main.urls SELECT * FROM spider.urls")
               master.execute("DETACH DATABASE spider")
               print(f"➕ {os.path.basename(db_path)} merged")
 
-          # 4. Count + export
           total = master.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
           print(f"🎉 Master DB created: {total} UNIQUE URLs (duplicates removed)")
 
-          # 5. Export links.txt
           with open("links.txt", "w", encoding="utf-8") as f:
               c = master.execute("SELECT url FROM urls")
               while True:
@@ -337,7 +367,6 @@ jobs:
                   f.writelines(row[0] + "\n" for row in rows)
           print(f"✅ links.txt exported ({os.path.getsize('links.txt')} bytes)")
 
-          # 6. Split into <2GB final shards
           MAX_SIZE = int(os.environ.get("MAX_DB_SIZE", 1900000000))
           os.makedirs("final_shards", exist_ok=True)
           last = 0; idx = 1; total_split = 0
@@ -369,9 +398,9 @@ jobs:
           master.close()
           PYEOF
 
-      - name: Package deduplicated output
+      - name: Package deduplicated output aggressively
         run: |
-          tar -I pigz -cf dedup-output.tar.gz final_shards links.txt
+          tar -I "pigz -9" -cf dedup-output.tar.gz final_shards links.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -381,7 +410,7 @@ jobs:
 
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 12: GitHub Release Uploader
+  #  Job 14: GitHub Release Uploader
   # ═══════════════════════════════════════════════════════════════════
   github-release-upload:
     needs: deduplicator
@@ -422,7 +451,7 @@ jobs:
 
 
   # ═══════════════════════════════════════════════════════════════════
-  #  Job 13: Internet Archive Uploader
+  #  Job 14+: Internet Archive Uploader
   # ═══════════════════════════════════════════════════════════════════
   internet-archive-upload:
     needs: deduplicator
