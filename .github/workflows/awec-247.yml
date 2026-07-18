@@ -36,6 +36,7 @@ jobs:
           for i in range(N):
               name = f"initial_shards/initial_shard_{i:04d}.db"
               conn = sqlite3.connect(name)
+              conn.execute("PRAGMA journal_mode=WAL")
               conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
               conn.commit()
               conn.close()
@@ -105,24 +106,21 @@ jobs:
         run: |
           mkdir -p shard_data
           
-          # Հարցնում ենք վերջին ռիլիզը
           RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/releases/latest")
           
-          # Եթե API-ն սխալ չի տվել, մշակում ենք
-          if ! echo "$RESPONSE" | jq -e '.message' >/dev/null 2>&1; then
-            # 1. Փնտրում ենք հենց այս շարդին համապատասխանող հին .db ֆայլը (օրինակ՝ links_part_0001.db)
-            # Քանի որ ռիլիզի ֆայլերը 1-ից են սկսում, ինդեքսին գումարում ենք 1
+          if [ -n "$RESPONSE" ] && ! echo "$RESPONSE" | jq -e '.message' >/dev/null 2>&1; then
             PART_NUM=$((SHARD_IDX + 1))
             TARGET_PART=$(printf "links_part_%04d.db" $PART_NUM)
             
-            # 2. Փնտրում ենք նաև ընդհանուր top_seeds.txt-ն
             ASSETS=$(echo "$RESPONSE" | jq -r --arg target "$TARGET_PART" '.assets[]? | objects | select(.name == $target or .name == "top_seeds.txt") | "\(.browser_download_url) \(.name)"')
             
             if [ -n "$ASSETS" ] && [ "$ASSETS" != "null" ]; then
               cd shard_data
               echo "$ASSETS" | while read -r url name; do
-                [ -n "$url" ] && [ "$url" != "null" ] && echo "$url" >> dls.txt
+                if [ -n "$url" ] && [ "$url" != "null" ]; then
+                  echo "$url" >> dls.txt
+                fi
               done
               [ -f dls.txt ] && aria2c -x4 -s4 -j4 -i dls.txt --console-log-level=warn || echo "Nothing for this shard"
               cd ..
@@ -144,8 +142,8 @@ jobs:
           conn = sqlite3.connect(db_file)
           conn.execute("PRAGMA journal_mode=MEMORY")
           conn.execute("PRAGMA synchronous=OFF")
+          conn.execute("PRAGMA cache_size=-20000")
           
-          # 1. Եթե քաշվել է հին համապատասխան բազայի կտորը, միացնում ենք
           old_dbs = [f for f in os.listdir("shard_data") if f.endswith(".db")] if os.path.isdir("shard_data") else []
           if old_dbs:
               old_db_path = os.path.join("shard_data", old_dbs[0])
@@ -159,7 +157,6 @@ jobs:
                   conn.executemany("INSERT OR IGNORE INTO urls VALUES (?)", rows)
               src.close()
           
-          # 2. Եթե կա top_seeds.txt, դրանից վերցնում ենք ՄԻԱՅՆ այս շարդին հասնող տողերը (Round-Robin)
           seeds_path = "shard_data/top_seeds.txt"
           if os.path.exists(seeds_path):
               print(f"Slicing top_seeds.txt specifically for shard {shard_idx}...")
@@ -226,7 +223,7 @@ jobs:
           c.execute('CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)')
           conn.commit()
           c.execute('SELECT url FROM urls')
-          with open(f'output/links_{shard_index}.txt', 'w') as f:
+          with open(f'output/links_{shard_index}.txt', 'w', encoding="utf-8") as f:
               while True:
                   rows = c.fetchmany(50000)
                   if not rows: break
@@ -271,19 +268,19 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import glob, subprocess, os, sqlite3
-          from collections import Counter
+          import shutil
 
           master = sqlite3.connect("master_links.db")
           master.execute("PRAGMA journal_mode=MEMORY")
           master.execute("PRAGMA synchronous=OFF")
-          master.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
+          master.execute("PRAGMA cache_size=-50000")
+          master.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY, hit_count INTEGER DEFAULT 1)")
+          master.execute("CREATE INDEX IF NOT EXISTS idx_hits ON urls(hit_count DESC)")
           master.commit()
 
           archives = glob.glob("all_spiders/**/*.tar.gz", recursive=True)
-          url_counts = Counter()
 
           for arch in archives:
-              import shutil
               shutil.rmtree("temp_extract", ignore_errors=True)
               os.makedirs("temp_extract", exist_ok=True)
               subprocess.run(["tar", "-I", "pigz", "-xf", arch, "-C", "temp_extract"])
@@ -297,9 +294,12 @@ jobs:
                   while True:
                       rows = shard_cursor.fetchmany(100000)
                       if not rows: break
-                      for row in rows:
-                          url_counts[row[0]] += 1
-                      master.executemany("INSERT OR IGNORE INTO urls VALUES (?)", rows)
+                      
+                      # Հիշողությունը չծանրաբեռնելու համար ներարկում ենք անմիջապես SQL-ով
+                      master.executemany("""
+                          INSERT INTO urls (url, hit_count) VALUES (?, 1)
+                          ON CONFLICT(url) DO UPDATE SET hit_count = hit_count + 1
+                      """, rows)
                   shard_conn.close()
                   master.commit()
               shutil.rmtree("temp_extract", ignore_errors=True)
@@ -314,40 +314,44 @@ jobs:
                   if not rows: break
                   f.writelines(row[0] + "\n" for row in rows)
 
-          # Ընտրում ենք 100,000 ամենաորակյալ հղումները հաջորդ ամբողջ մատրիցայի համար
-          top_seeds = [item[0] for item in url_counts.most_common(100000)]
-          if len(top_seeds) < 100000:
-              c = master.execute("SELECT url FROM urls LIMIT 100000")
-              top_seeds = list(set(top_seeds + [row[0] for row in c.fetchall()]))[:100000]
+          # Ընտրում ենք 100,000 ամենահաճախ հանդիպող (որակյալ) հղումները բազայից
+          c = master.execute("SELECT url FROM urls ORDER BY hit_count DESC LIMIT 100000")
+          top_seeds = [row[0] for row in c.fetchall()]
 
           with open("top_seeds.txt", "w", encoding="utf-8") as f:
               f.writelines(url + "\n" for url in top_seeds)
 
-          # Մասնատում ենք 10 հավասար ֆայնալ շարդերի
+          # Մասնատում ենք ֆայնալ շարդերի
           MAX_SIZE = int(os.environ.get("MAX_DB_SIZE", 1900000000))
           os.makedirs("final_shards", exist_ok=True)
-          last = 0; idx = 1
+          last_rowid = 0; idx = 1
+          
           while True:
               name = f"final_shards/links_part_{idx:04d}.db"
               shard = sqlite3.connect(name)
               shard.execute("PRAGMA synchronous=OFF")
               shard.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
-              rows = 0
+              rows_written = 0
+              
               while True:
                   batch = master.execute(
                       "SELECT rowid, url FROM urls WHERE rowid > ? ORDER BY rowid ASC LIMIT 500000",
-                      (last,)
+                      (last_rowid,)
                   ).fetchall()
                   if not batch: break
-                  last = batch[-1][0]
-                  shard.executemany("INSERT INTO urls VALUES (?)", [(r[1],) for r in batch])
-                  rows += len(batch)
+                  
+                  last_rowid = batch[-1][0]
+                  shard.executemany("INSERT OR IGNORE INTO urls VALUES (?)", [(r[1],) for r in batch])
+                  rows_written += len(batch)
                   if os.path.getsize(name) >= MAX_SIZE: break
-              shard.commit(); shard.close()
-              if rows == 0:
+                  
+              shard.commit()
+              shard.close()
+              if rows_written == 0:
                   if os.path.exists(name): os.remove(name)
                   break
               idx += 1
+              
           master.close()
           PYEOF
 
@@ -391,7 +395,10 @@ jobs:
 
             cd final_shards
             for f in links_part_*.db; do
-              [ -f "$f" ] && gh release upload "$TAG" "$f" --clobber &
+              if [ -f "$f" ]; then
+                gh release upload "$TAG" "$f" --clobber &
+                sleep 1 # API-ի Rate limit-ից խուսափելու համար
+              fi
             done
             if [ -f ../links.txt ]; then
               gh release upload "$TAG" ../links.txt --clobber &
@@ -435,7 +442,10 @@ jobs:
 
             cd final_shards
             for f in links_part_*.db; do
-              [ -f "$f" ] && ia upload "$IA_ID" "$f" --retries 5 &
+              if [ -f "$f" ]; then
+                ia upload "$IA_ID" "$f" --retries 5 &
+                sleep 1
+              fi
             done
             if [ -f ../links.txt ]; then
               ia upload "$IA_ID" ../links.txt --retries 5 &
