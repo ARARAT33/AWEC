@@ -19,124 +19,27 @@ env:
 jobs:
   prepare-shards:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    outputs:
-      TOTAL_OLD: ${{ steps.prep.outputs.TOTAL_OLD }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 jq curl aria2 pigz
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3
 
-      - name: Download latest release shards & structures
-        env:
-          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-        run: |
-          mkdir -p prev_release
-          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest")
-          
-          if echo "$RESPONSE" | jq -e '.message' >/dev/null 2>&1; then
-            echo "ℹ️ No previous release found or unauthorized."
-          else
-            ASSETS=$(echo "$RESPONSE" | jq -r '.assets[]? | objects | select(.name | test("^links_part_.*\\.db$") or .name == "top_seeds.txt") | "\(.browser_download_url) \(.name)"')
-            if [ -n "$ASSETS" ] && [ "$ASSETS" != "null" ]; then
-              cd prev_release
-              echo "$ASSETS" | while read -r url name; do
-                [ -n "$url" ] && [ "$url" != "null" ] && echo "$url" >> urls.txt
-              done
-              [ -f urls.txt ] && aria2c -x8 -s8 -j8 -i urls.txt --console-log-level=warn || echo "No assets to download"
-            fi
-          fi
-
-      - name: Download recovery checkpoints
-        id: dl_checkpoints
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: 'checkpoint-shard-*'
-          path: recovery_checkpoints
-
-      - name: Merge all sources into one links.db
+      - name: Create Clean Skeletal Shards Quickly
         run: |
           python3 << 'PYEOF'
-          import sqlite3, os, glob
-          files = []
-          for d in ["prev_release", "recovery_checkpoints"]:
-              if os.path.isdir(d):
-                  for f in glob.glob(os.path.join(d, "**", "*.db"), recursive=True):
-                      files.append(f)
-          
-          main = sqlite3.connect("links.db", timeout=60)
-          main.execute("PRAGMA journal_mode=WAL")
-          main.execute("PRAGMA synchronous=NORMAL")
-          main.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
-          main.commit()
-          
-          for f in files:
-              src_conn = sqlite3.connect(f"file:{f}?mode=ro", uri=True)
-              cursor = src_conn.cursor()
-              cursor.execute("SELECT url FROM urls")
-              while True:
-                  rows = cursor.fetchmany(100000)
-                  if not rows: break
-                  main.executemany("INSERT OR IGNORE INTO urls VALUES (?)", rows)
-              src_conn.close()
-              main.commit()
-              print(f"➕ {os.path.basename(f)} merged")
-          main.close()
-          print("🎉 All sources unified into links.db")
-          PYEOF
-
-      - name: Split and Share Top Seeds Across 10 Shards
-        run: |
-          python3 << 'PYEOF'
-          import sqlite3, os, hashlib
-          SRC = "links.db"
+          import sqlite3, os
           N = int(os.environ["MATRIX_SIZE"])
           os.makedirs("initial_shards", exist_ok=True)
-          
-          # 1. Ստեղծում ենք 10 դատարկ շարդ բազաներ RAM-ի ռեժիմով
-          conns = []
           for i in range(N):
               name = f"initial_shards/initial_shard_{i:04d}.db"
-              conn = sqlite3.connect(name, timeout=60)
-              conn.execute("PRAGMA journal_mode=MEMORY")
-              conn.execute("PRAGMA synchronous=OFF")
+              conn = sqlite3.connect(name)
               conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
-              conns.append(conn)
-          
-          # 2. Եթե կա նախորդ ռանից եկած top_seeds.txt, կարդում ենք և ՀԱՎԱՍԱՐ բաժանում 10 հոգու մեջ
-          seeds_loaded = 0
-          seeds_path = "prev_release/top_seeds.txt"
-          if os.path.exists(seeds_path):
-              print("🎯 Loading top_seeds.txt and partitioning among 10 shards...")
-              with open(seeds_path, "r", encoding="utf-8") as f:
-                  for idx, line in enumerate(f):
-                      url = line.strip()
-                      if url:
-                          # Բաշխում ենք ըստ ինդեքսի (Round-Robin), որ 10 հոգին ստանան տարբեր 10,000-ական հղումներ
-                          target_shard = idx % N
-                          conns[target_shard].execute("INSERT OR IGNORE INTO urls VALUES (?)", (url,))
-                          seeds_loaded += 1
-              print(f"🔥 Distributed {seeds_loaded} seed URLs to 10 shards dynamically!")
-          
-          # 3. Մնացած հին հղումները (եթե կան բազայում) լցնում ենք ըստ հեշի, որ դուբլիկատ չլինի
-          src = sqlite3.connect(SRC, timeout=60)
-          c = src.cursor()
-          c.execute("SELECT url FROM urls")
-          count = 0
-          for (url,) in c:
-              bucket = int(hashlib.md5(url.encode()).hexdigest(), 16) % N
-              conns[bucket].execute("INSERT OR IGNORE INTO urls VALUES (?)", (url,))
-              count += 1
-              if count % 1000000 == 0:
-                  for x in conns: x.commit()
-                  
-          for x in conns: x.commit(); x.close()
-          src.close()
-          print(f"✅ Finished preparing shards. Shard seeds embedded successfully.")
+              conn.commit()
+              conn.close()
+          print(f"✅ Skeletal {N} shards initialized.")
           PYEOF
 
       - uses: actions/upload-artifact@v4
@@ -144,12 +47,6 @@ jobs:
           name: all-initial-shards
           path: initial_shards/initial_shard_*.db
           retention-days: 1
-
-      - name: Set outputs
-        id: prep
-        run: |
-          TOTAL=$(sqlite3 links.db "SELECT COUNT(*) FROM urls" 2>/dev/null || echo 0)
-          echo "TOTAL_OLD=$TOTAL" >> $GITHUB_OUTPUT
 
   spider-matrix:
     needs: prepare-shards
@@ -169,7 +66,7 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
       - run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+          sudo apt-get update -qq && sudo apt-get install -y -qq pigz sqlite3 jq curl aria2
           pip install -q aiohttp
 
       - uses: actions/download-artifact@v4
@@ -182,11 +79,8 @@ jobs:
         run: |
           SHARD_STR=$(printf "%04d" ${{ matrix.shard }})
           FILE="initial_shards/initial_shard_${SHARD_STR}.db"
-          if [ ! -f "$FILE" ]; then
-            echo "❌ Missing $FILE"
-            exit 1
-          fi
           echo "DB_FILE=$FILE" >> $GITHUB_OUTPUT
+          echo "SHARD_STR=$SHARD_STR" >> $GITHUB_OUTPUT
 
       - name: Restore checkpoint if exists
         continue-on-error: true
@@ -198,20 +92,95 @@ jobs:
       - name: Extract checkpoint
         run: |
           if [ -f checkpoint.tar.gz ]; then
-            tar -xzf checkpoint.tar.gz
-            echo "🔄 Checkpoint restored"
-          else
-            echo "ℹ️ Fresh start"
+            tar -xzf checkpoint.tar.gz && echo "🔄 Checkpoint restored"
           fi
 
+      - name: 📥 Shard Independent Download (Get my specific data only)
+        id: dl_asset
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          SHARD_STR: ${{ steps.find_db.outputs.SHARD_STR }}
+          SHARD_IDX: ${{ matrix.shard }}
+        run: |
+          mkdir -p shard_data
+          
+          # Հարցնում ենք վերջին ռիլիզը
+          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          
+          # Եթե API-ն սխալ չի տվել, մշակում ենք
+          if ! echo "$RESPONSE" | jq -e '.message' >/dev/null 2>&1; then
+            # 1. Փնտրում ենք հենց այս շարդին համապատասխանող հին .db ֆայլը (օրինակ՝ links_part_0001.db)
+            # Քանի որ ռիլիզի ֆայլերը 1-ից են սկսում, ինդեքսին գումարում ենք 1
+            PART_NUM=$((SHARD_IDX + 1))
+            TARGET_PART=$(printf "links_part_%04d.db" $PART_NUM)
+            
+            # 2. Փնտրում ենք նաև ընդհանուր top_seeds.txt-ն
+            ASSETS=$(echo "$RESPONSE" | jq -r --arg target "$TARGET_PART" '.assets[]? | objects | select(.name == $target or .name == "top_seeds.txt") | "\(.browser_download_url) \(.name)"')
+            
+            if [ -n "$ASSETS" ] && [ "$ASSETS" != "null" ]; then
+              cd shard_data
+              echo "$ASSETS" | while read -r url name; do
+                [ -n "$url" ] && [ "$url" != "null" ] && echo "$url" >> dls.txt
+              done
+              [ -f dls.txt ] && aria2c -x4 -s4 -j4 -i dls.txt --console-log-level=warn || echo "Nothing for this shard"
+              cd ..
+            fi
+          fi
+
+      - name: Inject Downloaded Assets into Active Shard DB
+        env:
+          DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
+          SHARD_IDX: ${{ matrix.shard }}
+          TOTAL_SHARDS: ${{ env.MATRIX_SIZE }}
+        run: |
+          python3 << 'PYEOF'
+          import sqlite3, os
+          db_file = os.environ['DB_FILE']
+          shard_idx = int(os.environ['SHARD_IDX'])
+          total_shards = int(os.environ['TOTAL_SHARDS'])
+          
+          conn = sqlite3.connect(db_file)
+          conn.execute("PRAGMA journal_mode=MEMORY")
+          conn.execute("PRAGMA synchronous=OFF")
+          
+          # 1. Եթե քաշվել է հին համապատասխան բազայի կտորը, միացնում ենք
+          old_dbs = [f for f in os.listdir("shard_data") if f.endswith(".db")] if os.path.isdir("shard_data") else []
+          if old_dbs:
+              old_db_path = os.path.join("shard_data", old_dbs[0])
+              print(f"Merging legacy shard asset: {old_db_path}")
+              src = sqlite3.connect(f"file:{old_db_path}?mode=ro", uri=True)
+              cursor = src.cursor()
+              cursor.execute("SELECT url FROM urls")
+              while True:
+                  rows = cursor.fetchmany(50000)
+                  if not rows: break
+                  conn.executemany("INSERT OR IGNORE INTO urls VALUES (?)", rows)
+              src.close()
+          
+          # 2. Եթե կա top_seeds.txt, դրանից վերցնում ենք ՄԻԱՅՆ այս շարդին հասնող տողերը (Round-Robin)
+          seeds_path = "shard_data/top_seeds.txt"
+          if os.path.exists(seeds_path):
+              print(f"Slicing top_seeds.txt specifically for shard {shard_idx}...")
+              with open(seeds_path, "r", encoding="utf-8") as f:
+                  for idx, line in enumerate(f):
+                      if idx % total_shards == shard_idx:
+                          url = line.strip()
+                          if url:
+                              conn.execute("INSERT OR IGNORE INTO urls VALUES (?)", (url,))
+                              
+          conn.commit()
+          conn.close()
+          print("🎉 Target injection complete for this matrix cell.")
+          PYEOF
+
       - name: 🕷️ Run Spider
-        id: spider
         env:
           DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
           SHARD_INDEX: ${{ matrix.shard }}
           TOTAL_SHARDS: ${{ env.MATRIX_SIZE }}
         run: |
-          # Քանի որ սերմերն արդեն ներսում են, լրացուցիչ --seeds արգումենտի կարիք չկա
           python collector_247.py \
             --db "$DB_FILE" \
             --shard-index "$SHARD_INDEX" \
@@ -221,21 +190,17 @@ jobs:
           SLEEP_PID=$!
           wait -n $SLEEP_PID $SPIDER_PID || true
           if kill -0 $SPIDER_PID 2>/dev/null; then
-            echo "⏰ Limits reached – sending SIGINT"
             kill -INT $SPIDER_PID
             wait $SPIDER_PID 2>/dev/null || true
           fi
 
-      - name: 💾 Pack checkpoint on interruption
+      - name: 💾 Pack checkpoint on failure
         if: cancelled() || failure()
         id: save_ckpt
         run: |
           if [ -d "checkpoints" ]; then
             tar -czf checkpoint.tar.gz checkpoints
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
-            echo "💾 Checkpoint packed"
-          else
-            echo "⚠️ No checkpoints dir found!"
           fi
 
       - uses: actions/upload-artifact@v4
@@ -245,7 +210,7 @@ jobs:
           path: checkpoint.tar.gz
           retention-days: 1
 
-      - name: 📦 Prepare spider output (raw DB + txt)
+      - name: 📦 Prepare spider output
         if: always()
         env:
           DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
@@ -256,7 +221,7 @@ jobs:
           import sqlite3, os
           db_file = os.environ['DB_FILE']
           shard_index = os.environ['SHARD_INDEX']
-          conn = sqlite3.connect(db_file, timeout=60)
+          conn = sqlite3.connect(db_file)
           c = conn.cursor()
           c.execute('CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)')
           conn.commit()
@@ -284,11 +249,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Aggressive Space Clearance
+      - name: Space Clearance
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/share/swift /usr/local/share/powershell
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
           docker rmi $(docker images -q) -f || true
-          sudo apt-get clean && sudo rm -rf /var/lib/apt/lists/*
           df -h
 
       - uses: actions/checkout@v4
@@ -303,21 +267,19 @@ jobs:
           pattern: 'spider-output-shard-*'
           path: all_spiders
 
-      - name: Stream Merge and Extract 100K Top Quality Seeds
+      - name: Stream Merge & Global Deduplication & Seed Extraction
         run: |
           python3 << 'PYEOF'
           import glob, subprocess, os, sqlite3
           from collections import Counter
 
-          master = sqlite3.connect("master_links.db", timeout=60)
+          master = sqlite3.connect("master_links.db")
           master.execute("PRAGMA journal_mode=MEMORY")
           master.execute("PRAGMA synchronous=OFF")
           master.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
           master.commit()
 
           archives = glob.glob("all_spiders/**/*.tar.gz", recursive=True)
-          print(f"📊 Found {len(archives)} archives to merge...")
-
           url_counts = Counter()
 
           for arch in archives:
@@ -331,7 +293,6 @@ jobs:
                   db_path = os.path.abspath(db_files[0])
                   shard_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
                   shard_cursor = shard_conn.cursor()
-                  
                   shard_cursor.execute("SELECT url FROM urls")
                   while True:
                       rows = shard_cursor.fetchmany(100000)
@@ -344,7 +305,7 @@ jobs:
               shutil.rmtree("temp_extract", ignore_errors=True)
 
           total = master.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
-          print(f"🎉 Master DB created: {total} UNIQUE URLs")
+          print(f"🎉 Unified Total Unique URLs: {total}")
 
           with open("links.txt", "w", encoding="utf-8") as f:
               c = master.execute("SELECT url FROM urls")
@@ -353,10 +314,8 @@ jobs:
                   if not rows: break
                   f.writelines(row[0] + "\n" for row in rows)
 
-          # 100,000 թոփ հղումները առանձնացնում ենք
-          print("🎯 Extracting top 100,000 high-frequency seed links...")
+          # Ընտրում ենք 100,000 ամենաորակյալ հղումները հաջորդ ամբողջ մատրիցայի համար
           top_seeds = [item[0] for item in url_counts.most_common(100000)]
-          
           if len(top_seeds) < 100000:
               c = master.execute("SELECT url FROM urls LIMIT 100000")
               top_seeds = list(set(top_seeds + [row[0] for row in c.fetchall()]))[:100000]
@@ -364,14 +323,14 @@ jobs:
           with open("top_seeds.txt", "w", encoding="utf-8") as f:
               f.writelines(url + "\n" for url in top_seeds)
 
-          # Մասնատում ենք ֆայնալ շարդերի
+          # Մասնատում ենք 10 հավասար ֆայնալ շարդերի
           MAX_SIZE = int(os.environ.get("MAX_DB_SIZE", 1900000000))
           os.makedirs("final_shards", exist_ok=True)
-          last = 0; idx = 1; total_split = 0
+          last = 0; idx = 1
           while True:
               name = f"final_shards/links_part_{idx:04d}.db"
-              shard = sqlite3.connect(name, timeout=60)
-              shard.execute("PRAGMA synchronous=OFF"); shard.execute("PRAGMA journal_mode=OFF")
+              shard = sqlite3.connect(name)
+              shard.execute("PRAGMA synchronous=OFF")
               shard.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
               rows = 0
               while True:
@@ -388,12 +347,11 @@ jobs:
               if rows == 0:
                   if os.path.exists(name): os.remove(name)
                   break
-              total_split += rows
               idx += 1
           master.close()
           PYEOF
 
-      - name: Package deduplicated output
+      - name: Package Final Data
         run: tar -I pigz -cf dedup-output.tar.gz final_shards links.txt top_seeds.txt
 
       - uses: actions/upload-artifact@v4
@@ -418,7 +376,7 @@ jobs:
       - name: Extract
         run: tar -I pigz -xf dedup-output.tar.gz || echo "No archive found"
 
-      - name: 🚀 Create GitHub Release & Upload
+      - name: 🚀 Publish to GitHub Releases
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
           TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
@@ -427,8 +385,8 @@ jobs:
             echo "$GITHUB_TOKEN" | gh auth login --with-token
             TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
             gh release create "$TAG" \
-              --title "AWEC Run $(date +'%Y%m%d_%H%M%S')" \
-              --notes "${TOTAL} unique links collected." \
+              --title "AWEC Matrix Run $(date +'%Y%m%d_%H%M%S')" \
+              --notes "${TOTAL} unique links archived." \
               --target main || echo "Release exists"
 
             cd final_shards
@@ -460,7 +418,7 @@ jobs:
       - name: Extract
         run: tar -I pigz -xf dedup-output.tar.gz || echo "No archive found"
 
-      - name: 📤 Upload to Internet Archive
+      - name: 📤 Publish to Internet Archive
         env:
           IA_ACCESS_KEY: '${{ secrets.IA_ACCESS_KEY }}'
           IA_SECRET_KEY: '${{ secrets.IA_SECRET_KEY }}'
