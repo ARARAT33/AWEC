@@ -306,11 +306,9 @@ jobs:
                       print(f"⚠️ Malformed database detected ({db_path}). Attempting auto-recovery...")
                       recovered_db = db_path + ".recovered"
                       
-                      # Փորձ 1. .recover հրամանով
                       recover_cmd = f"sqlite3 {db_path} '.recover' | sqlite3 {recovered_db}"
                       subprocess.run(recover_cmd, shell=True)
                       
-                      # Փորձ 2. Եթե .recover-ը ձախողվեց sqlite_dbpage-ի պատճառով, օգտագործում ենք .dump
                       if not os.path.exists(recovered_db) or os.path.getsize(recovered_db) == 0:
                           print(f"🔄 .recover failed or empty, trying fallback .dump method...")
                           dump_cmd = f"sqlite3 {db_path} '.dump' | grep -v 'sqlite_dbpage' | sqlite3 {recovered_db}"
@@ -320,7 +318,6 @@ jobs:
                           try:
                               rec_conn = sqlite3.connect(recovered_db)
                               rec_cursor = rec_conn.cursor()
-                              # Ստեղծում ենք աղյուսակը, եթե դամփի մեջ չի եղել
                               rec_cursor.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
                               rec_cursor.execute("SELECT url FROM urls")
                               while True:
@@ -419,13 +416,13 @@ jobs:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
           TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
         run: |
-          if [ -d "final_shards" ]; then
-            TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
-            gh release create "$TAG" \
-              --title "AWEC Matrix Run $(date +'%Y%m%d_%H%M%S')" \
-              --notes "${TOTAL} unique links archived." \
-              --target main || echo "Release exists"
+          TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
+          gh release create "$TAG" \
+            --title "AWEC Matrix Run $(date +'%Y%m%d_%H%M%S')" \
+            --notes "${TOTAL} unique links archived." \
+            --target main || echo "Release exists"
 
+          if [ -d "final_shards" ]; then
             cd final_shards
             for f in links_part_*.db; do
               if [ -f "$f" ]; then
@@ -433,14 +430,16 @@ jobs:
                 sleep 1
               fi
             done
-            if [ -f ../links.txt ]; then
-              gh release upload "$TAG" ../links.txt --clobber &
-            fi
-            if [ -f ../top_seeds.txt ]; then
-              gh release upload "$TAG" ../top_seeds.txt --clobber &
-            fi
-            wait
+            cd ..
           fi
+
+          if [ -f links.txt ]; then
+            gh release upload "$TAG" links.txt --clobber &
+          fi
+          if [ -f top_seeds.txt ]; then
+            gh release upload "$TAG" top_seeds.txt --clobber &
+          fi
+          wait
 
   internet-archive-upload:
     needs: deduplicator
@@ -464,11 +463,11 @@ jobs:
           IA_SECRET_KEY: '${{ secrets.IA_SECRET_KEY }}'
           IA_ID: 'awec_links_${{ github.run_id }}_${{ github.run_attempt }}'
         run: |
-          if [ -d "final_shards" ]; then
-            pip install -q internetarchive
-            mkdir -p ~/.config
-            printf "[s3]\naccess = %s\nsecret = %s\n" "$IA_ACCESS_KEY" "$IA_SECRET_KEY" > ~/.config/ia.ini
+          pip install -q internetarchive
+          mkdir -p ~/.config
+          printf "[s3]\naccess = %s\nsecret = %s\n" "$IA_ACCESS_KEY" "$IA_SECRET_KEY" > ~/.config/ia.ini
 
+          if [ -d "final_shards" ]; then
             cd final_shards
             for f in links_part_*.db; do
               if [ -f "$f" ]; then
@@ -476,11 +475,13 @@ jobs:
                 sleep 1
               fi
             done
-            if [ -f ../links.txt ]; then
-              ia upload "$IA_ID" ../links.txt --retries 5 &
-            fi
-            if [ -f ../top_seeds.txt ]; then
-              ia upload "$IA_ID" ../top_seeds.txt --retries 5 &
-            fi
-            wait
+            cd ..
           fi
+
+          if [ -f links.txt ]; then
+            ia upload "$IA_ID" links.txt --retries 5 &
+          fi
+          if [ -f top_seeds.txt ]; then
+            ia upload "$IA_ID" top_seeds.txt --retries 5 &
+          fi
+          wait
