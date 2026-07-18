@@ -284,7 +284,7 @@ jobs:
           python3 << 'PYEOF'
           import glob, subprocess, os, sqlite3
 
-          master = sqlite3.connect("master_links.db", timeout=30)
+          master = sqlite3.connect("master_links.db", timeout=60)
           master.execute("PRAGMA journal_mode=OFF")
           master.execute("PRAGMA synchronous=OFF")
           master.execute("PRAGMA cache_size=-4000000")
@@ -302,11 +302,11 @@ jobs:
               print(f"Extracting {arch}...")
               subprocess.run(["tar", "-I", "pigz", "-xf", arch, "-C", "temp_extract"])
               
-         db_files = glob.glob("temp_extract/spider_*.db")
+              db_files = glob.glob("temp_extract/spider_*.db")
               if db_files:
                   db_path = db_files[0]
                   master.execute(f"ATTACH DATABASE '{db_path}' AS spider")
-                  # Միայն կարդում ենք, ոչ մի CREATE TABLE կցված բազայի վրա
+                  # Ուղղված է՝ Միայն կարդում ենք, առանց կողպված բազայի վրա աղյուսակ ստեղծելու փորձի
                   master.execute("INSERT OR IGNORE INTO main.urls SELECT * FROM spider.urls")
                   master.execute("DETACH DATABASE spider")
                   print(f"➕ {os.path.basename(db_path)} merged")
