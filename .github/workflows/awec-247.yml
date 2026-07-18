@@ -401,6 +401,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
       - uses: actions/download-artifact@v4
         continue-on-error: true
@@ -415,9 +416,11 @@ jobs:
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
           TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
+          REPO: '${{ github.repository }}'
         run: |
           TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
           gh release create "$TAG" \
+            --repo "$REPO" \
             --title "AWEC Matrix Run $(date +'%Y%m%d_%H%M%S')" \
             --notes "${TOTAL} unique links archived." \
             --target main || echo "Release exists"
@@ -426,7 +429,7 @@ jobs:
             cd final_shards
             for f in links_part_*.db; do
               if [ -f "$f" ]; then
-                gh release upload "$TAG" "$f" --clobber &
+                gh release upload "$TAG" "$f" --repo "../$REPO" --clobber &
                 sleep 1
               fi
             done
@@ -434,10 +437,10 @@ jobs:
           fi
 
           if [ -f links.txt ]; then
-            gh release upload "$TAG" links.txt --clobber &
+            gh release upload "$TAG" links.txt --repo "$REPO" --clobber &
           fi
           if [ -f top_seeds.txt ]; then
-            gh release upload "$TAG" top_seeds.txt --clobber &
+            gh release upload "$TAG" top_seeds.txt --repo "$REPO" --clobber &
           fi
           wait
 
@@ -447,6 +450,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
       - uses: actions/download-artifact@v4
         continue-on-error: true
