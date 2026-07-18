@@ -12,7 +12,7 @@ permissions:
 
 env:
   MATRIX_SIZE: 10
-  CRAWL_TIME_SEC: 18000 # 5 ժամ՝ GitHub-ի 6 ժամյա սահմանափակման մեջ սիրուն տեղավորվելու համար
+  CRAWL_TIME_SEC: 18000 # 5 ժամ
   MAX_DB_SIZE: 1900000000
   DEDUP_BATCH: 1000000
 
@@ -34,17 +34,20 @@ jobs:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
         run: |
           mkdir -p prev_release
-          # Ներբեռնում ենք և՛ հին բազաները, և՛ հատուկ թոփ հղումների ֆայլը, եթե կա
-          ASSETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            | jq -r '.assets[]? | select(.name | test("^links_part_.*\\.db$") or .name == "top_seeds.txt") | "\(.browser_download_url) \(.name)"')
-          if [ -n "$ASSETS" ]; then
-            cd prev_release
-            echo "$ASSETS" | while read -r url name; do echo "$url" >> urls.txt; done
-            aria2c -x8 -s8 -j8 -i urls.txt --console-log-level=warn
-            echo "✅ Downloaded assets from last release"
+          RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/latest")
+          
+          if echo "$RESPONSE" | jq -e '.message' >/dev/null 2>&1; then
+            echo "ℹ️ No previous release found or unauthorized."
           else
-            echo "ℹ️ No previous release found"
+            ASSETS=$(echo "$RESPONSE" | jq -r '.assets[]? | objects | select(.name | test("^links_part_.*\\.db$") or .name == "top_seeds.txt") | "\(.browser_download_url) \(.name)"')
+            if [ -n "$ASSETS" ] && [ "$ASSETS" != "null" ]; then
+              cd prev_release
+              echo "$ASSETS" | while read -r url name; do
+                [ -n "$url" ] && [ "$url" != "null" ] && echo "$url" >> urls.txt
+              done
+              [ -f urls.txt ] && aria2c -x8 -s8 -j8 -i urls.txt --console-log-level=warn || echo "No assets to download"
+            fi
           fi
 
       - name: Download recovery checkpoints
@@ -64,21 +67,14 @@ jobs:
               if os.path.isdir(d):
                   for f in glob.glob(os.path.join(d, "**", "*.db"), recursive=True):
                       files.append(f)
-          if not files:
-              conn = sqlite3.connect("links.db", timeout=60)
-              conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
-              conn.commit(); conn.close()
-              print("ℹ️ Empty DB created")
-              exit(0)
           
           main = sqlite3.connect("links.db", timeout=60)
-          main.execute("PRAGMA journal_mode=WAL") # Միացնում ենք WAL ռեժիմը՝ զուգահեռ գրել/կարդալու համար
+          main.execute("PRAGMA journal_mode=WAL")
           main.execute("PRAGMA synchronous=NORMAL")
           main.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
           main.commit()
           
           for f in files:
-              # Բացում ենք աղբյուրները միայն կարդալու ռեժիմով, որ lock-երը չխանգարեն
               src_conn = sqlite3.connect(f"file:{f}?mode=ro", uri=True)
               cursor = src_conn.cursor()
               cursor.execute("SELECT url FROM urls")
@@ -90,35 +86,57 @@ jobs:
               main.commit()
               print(f"➕ {os.path.basename(f)} merged")
           main.close()
-          print("🎉 All sources unified")
+          print("🎉 All sources unified into links.db")
           PYEOF
 
-      - name: Split into initial shards
+      - name: Split and Share Top Seeds Across 10 Shards
         run: |
           python3 << 'PYEOF'
           import sqlite3, os, hashlib
-          SRC = "links.db"; N = int(os.environ["MATRIX_SIZE"])
+          SRC = "links.db"
+          N = int(os.environ["MATRIX_SIZE"])
           os.makedirs("initial_shards", exist_ok=True)
-          src = sqlite3.connect(SRC, timeout=60); c = src.cursor()
+          
+          # 1. Ստեղծում ենք 10 դատարկ շարդ բազաներ RAM-ի ռեժիմով
           conns = []
           for i in range(N):
               name = f"initial_shards/initial_shard_{i:04d}.db"
               conn = sqlite3.connect(name, timeout=60)
-              conn.execute("PRAGMA journal_mode=MEMORY") # Ամբողջությամբ RAM-ի մեջ արագության համար
+              conn.execute("PRAGMA journal_mode=MEMORY")
               conn.execute("PRAGMA synchronous=OFF")
               conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
               conns.append(conn)
           
-          c.execute("SELECT url FROM urls"); count = 0
+          # 2. Եթե կա նախորդ ռանից եկած top_seeds.txt, կարդում ենք և ՀԱՎԱՍԱՐ բաժանում 10 հոգու մեջ
+          seeds_loaded = 0
+          seeds_path = "prev_release/top_seeds.txt"
+          if os.path.exists(seeds_path):
+              print("🎯 Loading top_seeds.txt and partitioning among 10 shards...")
+              with open(seeds_path, "r", encoding="utf-8") as f:
+                  for idx, line in enumerate(f):
+                      url = line.strip()
+                      if url:
+                          # Բաշխում ենք ըստ ինդեքսի (Round-Robin), որ 10 հոգին ստանան տարբեր 10,000-ական հղումներ
+                          target_shard = idx % N
+                          conns[target_shard].execute("INSERT OR IGNORE INTO urls VALUES (?)", (url,))
+                          seeds_loaded += 1
+              print(f"🔥 Distributed {seeds_loaded} seed URLs to 10 shards dynamically!")
+          
+          # 3. Մնացած հին հղումները (եթե կան բազայում) լցնում ենք ըստ հեշի, որ դուբլիկատ չլինի
+          src = sqlite3.connect(SRC, timeout=60)
+          c = src.cursor()
+          c.execute("SELECT url FROM urls")
+          count = 0
           for (url,) in c:
               bucket = int(hashlib.md5(url.encode()).hexdigest(), 16) % N
               conns[bucket].execute("INSERT OR IGNORE INTO urls VALUES (?)", (url,))
               count += 1
               if count % 1000000 == 0:
                   for x in conns: x.commit()
+                  
           for x in conns: x.commit(); x.close()
           src.close()
-          print(f"✅ {count} URLs split into {N} shards")
+          print(f"✅ Finished preparing shards. Shard seeds embedded successfully.")
           PYEOF
 
       - uses: actions/upload-artifact@v4
@@ -193,16 +211,11 @@ jobs:
           SHARD_INDEX: ${{ matrix.shard }}
           TOTAL_SHARDS: ${{ env.MATRIX_SIZE }}
         run: |
-          # Եթե նախորդ ռանից կա թոփ սերմեր (top_seeds.txt), փոխանցում ենք սպայդերին
-          TOP_SEEDS_ARG=""
-          if [ -f "prev_release/top_seeds.txt" ]; then
-             TOP_SEEDS_ARG="--seeds prev_release/top_seeds.txt"
-          fi
-
+          # Քանի որ սերմերն արդեն ներսում են, լրացուցիչ --seeds արգումենտի կարիք չկա
           python collector_247.py \
             --db "$DB_FILE" \
             --shard-index "$SHARD_INDEX" \
-            --total-shards "$TOTAL_SHARDS" $TOP_SEEDS_ARG &
+            --total-shards "$TOTAL_SHARDS" &
           SPIDER_PID=$!
           sleep $CRAWL_TIME_SEC &
           SLEEP_PID=$!
@@ -267,7 +280,7 @@ jobs:
 
   deduplicator:
     needs: spider-matrix
-    if: always() # Աշխատում է միշտ, նույնիսկ ձեռքով անջատելու (Cancel) դեպքում
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -285,7 +298,7 @@ jobs:
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 pigz
 
       - uses: actions/download-artifact@v4
-        continue-on-error: true # Եթե որոշ շարդեր չկան, մեկ է շարունակում ենք եղածով
+        continue-on-error: true
         with:
           pattern: 'spider-output-shard-*'
           path: all_spiders
@@ -297,7 +310,7 @@ jobs:
           from collections import Counter
 
           master = sqlite3.connect("master_links.db", timeout=60)
-          master.execute("PRAGMA journal_mode=MEMORY") # RAM-ի մեջ, որ զրո lock լինի
+          master.execute("PRAGMA journal_mode=MEMORY")
           master.execute("PRAGMA synchronous=OFF")
           master.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
           master.commit()
@@ -316,7 +329,6 @@ jobs:
               db_files = glob.glob("temp_extract/spider_*.db")
               if db_files:
                   db_path = os.path.abspath(db_files[0])
-                  # Բացում ենք Read-Only ռեժիմով՝ 100% երաշխիքով lock-երից խուսափելու համար
                   shard_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
                   shard_cursor = shard_conn.cursor()
                   
@@ -324,44 +336,35 @@ jobs:
                   while True:
                       rows = shard_cursor.fetchmany(100000)
                       if not rows: break
-                      
-                      # Հաշվում ենք հաճախականությունը թոփ 100,000-ի համար
                       for row in rows:
                           url_counts[row[0]] += 1
-                          
                       master.executemany("INSERT OR IGNORE INTO urls VALUES (?)", rows)
-                  
                   shard_conn.close()
                   master.commit()
-                  print(f"➕ {os.path.basename(db_path)} successfully merged")
               shutil.rmtree("temp_extract", ignore_errors=True)
 
           total = master.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
           print(f"🎉 Master DB created: {total} UNIQUE URLs")
 
-          # Գրում ենք հիմնական links.txt-ն
           with open("links.txt", "w", encoding="utf-8") as f:
               c = master.execute("SELECT url FROM urls")
               while True:
                   rows = c.fetchmany(100000)
                   if not rows: break
                   f.writelines(row[0] + "\n" for row in rows)
-          print("✅ links.txt exported")
 
-          # Ընտրում ենք 100,000 ամենաշատ կրկնված/ամենալավ հղումները որպես հաջորդ ռանի Seed
+          # 100,000 թոփ հղումները առանձնացնում ենք
           print("🎯 Extracting top 100,000 high-frequency seed links...")
           top_seeds = [item[0] for item in url_counts.most_common(100000)]
           
-          # Եթե ընդհանուր հղումները քիչ են 100կ-ից, լրացնում ենք եղածով
           if len(top_seeds) < 100000:
               c = master.execute("SELECT url FROM urls LIMIT 100000")
               top_seeds = list(set(top_seeds + [row[0] for row in c.fetchall()]))[:100000]
 
           with open("top_seeds.txt", "w", encoding="utf-8") as f:
               f.writelines(url + "\n" for url in top_seeds)
-          print(f"🔥 top_seeds.txt generated with {len(top_seeds)} items")
 
-          # Մասնատում ենք Բազան Ֆայնալ Շարդերի
+          # Մասնատում ենք ֆայնալ շարդերի
           MAX_SIZE = int(os.environ.get("MAX_DB_SIZE", 1900000000))
           os.makedirs("final_shards", exist_ok=True)
           last = 0; idx = 1; total_split = 0
@@ -386,16 +389,12 @@ jobs:
                   if os.path.exists(name): os.remove(name)
                   break
               total_split += rows
-              print(f"✅ Shard {name} – {rows} rows")
               idx += 1
-          print(f"🎉 Total split: {total_split} rows into {idx-1} shards")
           master.close()
           PYEOF
 
       - name: Package deduplicated output
-        run: |
-          # Արխիվի մեջ ենք դնում նաև մեր ստեղծած հատուկ թոփ ֆայլը
-          tar -I pigz -cf dedup-output.tar.gz final_shards links.txt top_seeds.txt
+        run: tar -I pigz -cf dedup-output.tar.gz final_shards links.txt top_seeds.txt
 
       - uses: actions/upload-artifact@v4
         with:
@@ -405,7 +404,7 @@ jobs:
 
   github-release-upload:
     needs: deduplicator
-    if: always() # Աշխատում է միշտ, նույնիսկ ձեռքով անջատելիս
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -429,8 +428,8 @@ jobs:
             TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
             gh release create "$TAG" \
               --title "AWEC Run $(date +'%Y%m%d_%H%M%S')" \
-              --notes "${TOTAL} unique links collected. Includes top_seeds.txt for the matrix." \
-              --target main || echo "⚠️ Release exists"
+              --notes "${TOTAL} unique links collected." \
+              --target main || echo "Release exists"
 
             cd final_shards
             for f in links_part_*.db; do
@@ -443,14 +442,11 @@ jobs:
               gh release upload "$TAG" ../top_seeds.txt --clobber &
             fi
             wait
-            echo "✅ GitHub Release complete"
-          else
-            echo "Skipping release upload, no final data available."
           fi
 
   internet-archive-upload:
     needs: deduplicator
-    if: always() # Աշխատում է միշտ, նույնիսկ ձեռքով անջատելիս
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -490,7 +486,4 @@ jobs:
               ia upload "$IA_ID" ../top_seeds.txt --retries 5 &
             fi
             wait
-            echo "✅ IA upload complete"
-          else
-            echo "Skipping IA upload, no final data available."
           fi
