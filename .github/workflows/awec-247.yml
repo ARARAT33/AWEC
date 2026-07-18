@@ -465,7 +465,7 @@ jobs:
         env:
           IA_ACCESS_KEY: '${{ secrets.IA_ACCESS_KEY }}'
           IA_SECRET_KEY: '${{ secrets.IA_SECRET_KEY }}'
-          IA_ID: 'awec_links_${{ github.run_id }}_${{ github.run_attempt }}'
+          IA_ID: 'awec_links_awe_o.s'
         run: |
           pip install -q internetarchive
           mkdir -p ~/.config
