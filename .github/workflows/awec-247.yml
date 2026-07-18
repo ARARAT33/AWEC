@@ -289,7 +289,6 @@ jobs:
               if db_files:
                   db_path = os.path.abspath(db_files[0])
                   
-                  # Փորձում ենք ստանդարտ միացում կատարել
                   try:
                       shard_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
                       shard_cursor = shard_conn.cursor()
@@ -304,20 +303,25 @@ jobs:
                       shard_conn.close()
                       master.commit()
                   except sqlite3.DatabaseError as e:
-                      # 🔴 Եթե բազան վնասված է (Malformed), ավտոմատ բժշկում ենք sqlite3 .recover-ով
                       print(f"⚠️ Malformed database detected ({db_path}). Attempting auto-recovery...")
                       recovered_db = db_path + ".recovered"
                       
-                      # CLI-ով կատարում ենք բազայի վերականգնում (Dump & Recover)
+                      # Փորձ 1. .recover հրամանով
                       recover_cmd = f"sqlite3 {db_path} '.recover' | sqlite3 {recovered_db}"
                       subprocess.run(recover_cmd, shell=True)
                       
-                      # Փորձում ենք կարդալ վերականգնված նոր բազայից
-                      if os.path.exists(recovered_db):
+                      # Փորձ 2. Եթե .recover-ը ձախողվեց sqlite_dbpage-ի պատճառով, օգտագործում ենք .dump
+                      if not os.path.exists(recovered_db) or os.path.getsize(recovered_db) == 0:
+                          print(f"🔄 .recover failed or empty, trying fallback .dump method...")
+                          dump_cmd = f"sqlite3 {db_path} '.dump' | grep -v 'sqlite_dbpage' | sqlite3 {recovered_db}"
+                          subprocess.run(dump_cmd, shell=True)
+                      
+                      if os.path.exists(recovered_db) and os.path.getsize(recovered_db) > 0:
                           try:
                               rec_conn = sqlite3.connect(recovered_db)
                               rec_cursor = rec_conn.cursor()
-                              # .recover-ը ստեղծում է նույն աղյուսակը կամ փրկված տվյալները
+                              # Ստեղծում ենք աղյուսակը, եթե դամփի մեջ չի եղել
+                              rec_cursor.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
                               rec_cursor.execute("SELECT url FROM urls")
                               while True:
                                   rows = rec_cursor.fetchmany(100000)
@@ -330,9 +334,9 @@ jobs:
                               master.commit()
                               print(f"✅ Successfully recovered data from {db_path}")
                           except Exception as rec_err:
-                              print(f"❌ Recovery failed for {db_path}, skipping entirely. Error: {rec_err}")
+                              print(f"❌ Recovery parsing failed for {db_path}. Error: {rec_err}")
                       else:
-                          print(f"❌ Critical: Could not recover any data from {db_path}, skipping.")
+                          print(f"❌ Critical: All recovery paths exhausted for {db_path}, skipping.")
                           
               shutil.rmtree("temp_extract", ignore_errors=True)
 
@@ -416,7 +420,6 @@ jobs:
           TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
         run: |
           if [ -d "final_shards" ]; then
-            echo "$GITHUB_TOKEN" | gh auth login --with-token
             TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
             gh release create "$TAG" \
               --title "AWEC Matrix Run $(date +'%Y%m%d_%H%M%S')" \
@@ -464,11 +467,7 @@ jobs:
           if [ -d "final_shards" ]; then
             pip install -q internetarchive
             mkdir -p ~/.config
-            cat << EOF > ~/.config/ia.ini
-            [s3]
-            access = $IA_ACCESS_KEY
-            secret = $IA_SECRET_KEY
-            EOF
+            printf "[s3]\naccess = %s\nsecret = %s\n" "$IA_ACCESS_KEY" "$IA_SECRET_KEY" > ~/.config/ia.ini
 
             cd final_shards
             for f in links_part_*.db; do
