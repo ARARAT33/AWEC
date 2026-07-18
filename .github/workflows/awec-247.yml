@@ -264,7 +264,7 @@ jobs:
           pattern: 'spider-output-shard-*'
           path: all_spiders
 
-      - name: Stream Merge & Global Deduplication & Seed Extraction
+      - name: Stream Merge & Global Deduplication & Auto-Recovery
         run: |
           python3 << 'PYEOF'
           import glob, subprocess, os, sqlite3
@@ -288,20 +288,52 @@ jobs:
               db_files = glob.glob("temp_extract/spider_*.db")
               if db_files:
                   db_path = os.path.abspath(db_files[0])
-                  shard_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-                  shard_cursor = shard_conn.cursor()
-                  shard_cursor.execute("SELECT url FROM urls")
-                  while True:
-                      rows = shard_cursor.fetchmany(100000)
-                      if not rows: break
+                  
+                  # Փորձում ենք ստանդարտ միացում կատարել
+                  try:
+                      shard_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                      shard_cursor = shard_conn.cursor()
+                      shard_cursor.execute("SELECT url FROM urls")
+                      while True:
+                          rows = shard_cursor.fetchmany(100000)
+                          if not rows: break
+                          master.executemany("""
+                              INSERT INTO urls (url, hit_count) VALUES (?, 1)
+                              ON CONFLICT(url) DO UPDATE SET hit_count = hit_count + 1
+                          """, rows)
+                      shard_conn.close()
+                      master.commit()
+                  except sqlite3.DatabaseError as e:
+                      # 🔴 Եթե բազան վնասված է (Malformed), ավտոմատ բժշկում ենք sqlite3 .recover-ով
+                      print(f"⚠️ Malformed database detected ({db_path}). Attempting auto-recovery...")
+                      recovered_db = db_path + ".recovered"
                       
-                      # Հիշողությունը չծանրաբեռնելու համար ներարկում ենք անմիջապես SQL-ով
-                      master.executemany("""
-                          INSERT INTO urls (url, hit_count) VALUES (?, 1)
-                          ON CONFLICT(url) DO UPDATE SET hit_count = hit_count + 1
-                      """, rows)
-                  shard_conn.close()
-                  master.commit()
+                      # CLI-ով կատարում ենք բազայի վերականգնում (Dump & Recover)
+                      recover_cmd = f"sqlite3 {db_path} '.recover' | sqlite3 {recovered_db}"
+                      subprocess.run(recover_cmd, shell=True)
+                      
+                      # Փորձում ենք կարդալ վերականգնված նոր բազայից
+                      if os.path.exists(recovered_db):
+                          try:
+                              rec_conn = sqlite3.connect(recovered_db)
+                              rec_cursor = rec_conn.cursor()
+                              # .recover-ը ստեղծում է նույն աղյուսակը կամ փրկված տվյալները
+                              rec_cursor.execute("SELECT url FROM urls")
+                              while True:
+                                  rows = rec_cursor.fetchmany(100000)
+                                  if not rows: break
+                                  master.executemany("""
+                                      INSERT INTO urls (url, hit_count) VALUES (?, 1)
+                                      ON CONFLICT(url) DO UPDATE SET hit_count = hit_count + 1
+                                  """, rows)
+                              rec_conn.close()
+                              master.commit()
+                              print(f"✅ Successfully recovered data from {db_path}")
+                          except Exception as rec_err:
+                              print(f"❌ Recovery failed for {db_path}, skipping entirely. Error: {rec_err}")
+                      else:
+                          print(f"❌ Critical: Could not recover any data from {db_path}, skipping.")
+                          
               shutil.rmtree("temp_extract", ignore_errors=True)
 
           total = master.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
@@ -314,14 +346,12 @@ jobs:
                   if not rows: break
                   f.writelines(row[0] + "\n" for row in rows)
 
-          # Ընտրում ենք 100,000 ամենահաճախ հանդիպող (որակյալ) հղումները բազայից
           c = master.execute("SELECT url FROM urls ORDER BY hit_count DESC LIMIT 100000")
           top_seeds = [row[0] for row in c.fetchall()]
 
           with open("top_seeds.txt", "w", encoding="utf-8") as f:
               f.writelines(url + "\n" for url in top_seeds)
 
-          # Մասնատում ենք ֆայնալ շարդերի
           MAX_SIZE = int(os.environ.get("MAX_DB_SIZE", 1900000000))
           os.makedirs("final_shards", exist_ok=True)
           last_rowid = 0; idx = 1
@@ -397,7 +427,7 @@ jobs:
             for f in links_part_*.db; do
               if [ -f "$f" ]; then
                 gh release upload "$TAG" "$f" --clobber &
-                sleep 1 # API-ի Rate limit-ից խուսափելու համար
+                sleep 1
               fi
             done
             if [ -f ../links.txt ]; then
