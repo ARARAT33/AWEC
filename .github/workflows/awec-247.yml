@@ -102,7 +102,7 @@ jobs:
       - name: Extract checkpoint
         run: |
           if [ -f checkpoint.tar.gz ]; then
-            tar -xzf checkpoint.tar.gz && echo "🔄 Checkpoint restored"
+            tar -I pigz -xf checkpoint.tar.gz && echo "🔄 Checkpoint restored"
           fi
 
       - name: 📥 Shard Independent Download
@@ -202,7 +202,7 @@ jobs:
         id: save_ckpt
         run: |
           if [ -d "checkpoints" ]; then
-            tar -czf checkpoint.tar.gz checkpoints
+            tar -I pigz -cf checkpoint.tar.gz checkpoints
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
           fi
 
@@ -330,8 +330,9 @@ jobs:
           cat extracted/links_*.txt > ia_package/links.txt 2>/dev/null || true
           cat extracted/links_*.txt 2>/dev/null | head -n 50000 > ia_package/top_seeds.txt || true
           
-          tar -I pigz -czf ia_package/all_matrix_shards.tar.gz -C extracted .
-          tar -I pigz -czf ia-ready.tar.gz -C ia_package .
+          # -czf-ը փոխարինված է -cf-ով՝ pigz-ի կոնֆլիկտը լուծելու համար
+          tar -I pigz -cf ia_package/all_matrix_shards.tar.gz -C extracted .
+          tar -I pigz -cf ia-ready.tar.gz -C ia_package .
 
       - name: 📤 Upload IA ready results
         uses: actions/upload-artifact@v4
