@@ -330,7 +330,6 @@ jobs:
           cat extracted/links_*.txt > ia_package/links.txt 2>/dev/null || true
           cat extracted/links_*.txt 2>/dev/null | head -n 50000 > ia_package/top_seeds.txt || true
           
-          # -czf-ը փոխարինված է -cf-ով՝ pigz-ի կոնֆլիկտը լուծելու համար
           tar -I pigz -cf ia_package/all_matrix_shards.tar.gz -C extracted .
           tar -I pigz -cf ia-ready.tar.gz -C ia_package .
 
@@ -345,7 +344,7 @@ jobs:
     needs: collect-matrix-outputs
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # Սահմանեցինք առավելագույն 6 ժամ, որպեսզի վերբեռնումը չընդհատվի
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
@@ -371,24 +370,33 @@ jobs:
           mkdir -p ~/.config
           printf "[s3]\naccess = %s\nsecret = %s\n" "$IA_ACCESS_KEY" "$IA_SECRET_KEY" > ~/.config/ia.ini
 
+          # Ընթացիկ ժամանակային դրոշմ՝ ՏարիԱմիսՕր_ԺամՐոպե (Օրինակ՝ 20260721_0030)
+          TIMESTAMP=$(date +'%Y%m%d_%H%M')
+
+          shopt -s nullglob
           if [ -d "ia_package" ]; then
             cd ia_package
-            for f in *; do
+            
+            # 1. Մեծ արխիվը (.tar.gz) բեռնում ենք հերթով՝ --retries 10-ով կայունության համար
+            for f in *.tar.gz; do
               if [ -f "$f" ]; then
-                echo "Uploading $f to Internet Archive..."
-                # Ավելացրել ենք --retries 10, որ եթե կապը կտրվի, ինքն իրեն շարունակի
-                ia upload "$IA_ID" "$f" --retries 10
+                REMOTE_NAME="${TIMESTAMP}_${f}"
+                echo "Uploading large archive as $REMOTE_NAME..."
+                ia upload "$IA_ID" "$f" --remote-name "$REMOTE_NAME" --retries 10
                 sleep 2
               fi
             done
-          fi
-          if [ -d "ia_package" ]; then
-            cd ia_package
-            for f in *; do
+
+            # 2. Թեթև տեքստային ֆայլերը (.txt) բեռնում ենք զուգահեռ
+            for f in *.txt; do
               if [ -f "$f" ]; then
-                ia upload "$IA_ID" "$f" --retries 5 &
+                REMOTE_NAME="${TIMESTAMP}_${f}"
+                echo "Uploading text metadata as $REMOTE_NAME in background..."
+                ia upload "$IA_ID" "$f" --remote-name "$REMOTE_NAME" --retries 5 &
                 sleep 1
               fi
             done
+            
+            # Սպասում ենք մինչև ֆոնային բեռնումները վերջնական ավարտվեն
             wait
           fi
