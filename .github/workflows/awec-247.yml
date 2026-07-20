@@ -96,7 +96,7 @@ jobs:
             tar -xzf checkpoint.tar.gz && echo "🔄 Checkpoint restored"
           fi
 
-      - name: 📥 Shard Independent Download (Get my specific data only)
+      - name: 📥 Shard Independent Download
         id: dl_asset
         continue-on-error: true
         env:
@@ -105,14 +105,12 @@ jobs:
           SHARD_IDX: ${{ matrix.shard }}
         run: |
           mkdir -p shard_data
-          
           RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/releases/latest")
           
           if [ -n "$RESPONSE" ] && ! echo "$RESPONSE" | jq -e '.message' >/dev/null 2>&1; then
             PART_NUM=$((SHARD_IDX + 1))
             TARGET_PART=$(printf "links_part_%04d.db" $PART_NUM)
-            
             ASSETS=$(echo "$RESPONSE" | jq -r --arg target "$TARGET_PART" '.assets[]? | objects | select(.name == $target or .name == "top_seeds.txt") | "\(.browser_download_url) \(.name)"')
             
             if [ -n "$ASSETS" ] && [ "$ASSETS" != "null" ]; then
@@ -169,7 +167,6 @@ jobs:
                               
           conn.commit()
           conn.close()
-          print("🎉 Target injection complete for this matrix cell.")
           PYEOF
 
       - name: 🕷️ Run Spider
@@ -240,8 +237,72 @@ jobs:
           path: spider-output.tar.gz
           retention-days: 1
 
+  # ԱՅՍ ՓՈՒԼԸ ԱՅԺՄ ԱՇԽԱՏՈՒՄ Է ԶՈՒԳԱՀԵՌ ՝ ԱՆԿԱԽ COLLECT-ԻՑ
+  github-release-upload:
+    needs: spider-matrix
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+
+      - name: 📥 Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: spider-output-shard-*
+          path: raw_shards
+
+      - name: 📦 Prepare Shards for Release
+        run: |
+          mkdir -p release_files
+          find raw_shards -name "*.tar.gz" -exec tar -I pigz -xf {} -C release_files \;
+          
+          cd release_files
+          cat links_*.txt > links.txt 2>/dev/null || true
+          cat links_*.txt 2>/dev/null | head -n 50000 > top_seeds.txt || true
+          
+          for f in spider_*.db; do
+            if [ -f "$f" ]; then
+              num=$(echo "$f" | grep -o -E '[0-9]+')
+              formatted_idx=$(printf "%04d" $((num + 1)))
+              mv "$f" "links_part_${formatted_idx}.db"
+            fi
+          done
+
+      - name: 🚀 Publish to GitHub Releases
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
+          REPO: '${{ github.repository }}'
+        run: |
+          cd release_files
+          TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "AWEC Matrix Run $(date +'%Y%m%d_%H%M%S')" \
+            --notes "${TOTAL} total links archived." \
+            --target main || echo "Release exists"
+
+          for f in links_part_*.db; do
+            if [ -f "$f" ]; then
+              gh release upload "$TAG" "$f" --repo "$REPO" --clobber &
+              sleep 1
+            fi
+          done
+          
+          if [ -f links.txt ]; then
+            gh release upload "$TAG" links.txt --repo "$REPO" --clobber &
+          fi
+          if [ -f top_seeds.txt ]; then
+            gh release upload "$TAG" top_seeds.txt --repo "$REPO" --clobber &
+          fi
+          wait
+
+  # ՍԱ ԱՇԽԱՏՈՒՄ Է GITHUB UPLOADER-ԻՆ ԶՈՒԳԱՀԵՌ՝ ՍԱՐՔԵԼՈՎ ՄԵԾ ՖԱՅԼԸ IA-Ի ՀԱՄԱՐ
   collect-matrix-outputs:
     needs: spider-matrix
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -253,95 +314,27 @@ jobs:
           pattern: spider-output-shard-*
           path: raw_shards
 
-      - name: 📦 Structure and Process Files
+      - name: 📦 Process Files for IA
         run: |
-          mkdir -p extracted final_shards ia_package
-          
-          # 1. Բացում ենք բոլոր սարդերի արխիվները մեկ թղթապանակում
+          mkdir -p extracted ia_package
           find raw_shards -name "*.tar.gz" -exec tar -I pigz -xf {} -C extracted \;
           
-          # 2. Պատրաստում ենք ֆայլերը GitHub-ի սպասած ձևաչափով (փոքր մասերով)
-          # Տեքստային ֆայլերից ընտրում ենք առաջին տողերը որպես top_seeds (առանց դեդուպլիկացիայի)
-          cat extracted/links_*.txt | head -n 50000 > top_seeds.txt
+          # Պատրաստում ենք մեծ ֆայլերը (Միացնում ենք բոլորը IA-ի համար)
+          cat extracted/links_*.txt > ia_package/links.txt 2>/dev/null || true
+          cat extracted/links_*.txt 2>/dev/null | head -n 50000 > ia_package/top_seeds.txt || true
           
-          # Առանձին բազաները վերանվանում ենք ըստ ինդեքսների (links_part_0001.db և այլն)
-          mkdir -p final_shards
-          idx=1
-          for f in extracted/spider_*.db; do
-            if [ -f "$f" ]; then
-              formatted_idx=$(printf "%04d" $idx)
-              cp "$f" "final_shards/links_part_${formatted_idx}.db"
-              idx=$((idx + 1))
-            fi
-          done
-          
-          # 3. Պատրաստում ենք Internet Archive-ի տարբերակը (1 մեծ փաթեթ)
-          # Միացնում ենք բոլոր տեքստային ֆայլերը 1 մեծ ֆայլի մեջ (առանց տողերի ջնջման)
-          cat extracted/links_*.txt > links.txt
-          
-          # Բոլոր 10 առանձին բազաները հավաքում ենք 1 մեծ արխիվի մեջ IA-ի համար
+          # 10 բազաները հավաքում ենք 1 մեծ արխիվի մեջ
           tar -I pigz -czf ia_package/all_matrix_shards.tar.gz -C extracted .
-          cp links.txt ia_package/
-          cp top_seeds.txt ia_package/
 
-          # 4. Արխիվացնում ենք ընդհանուր արդյունքը, որ փոխանցենք հաջորդ job-երին
-          tar -I pigz -czf dedup-output.tar.gz links.txt top_seeds.txt final_shards ia_package
+          # Փաթեթավորում ենք IA Ուղարկողի համար
+          tar -I pigz -czf ia-ready.tar.gz -C ia_package .
 
-      - name: 📤 Upload processed results
+      - name: 📤 Upload IA ready results
         uses: actions/upload-artifact@v4
         with:
-          name: dedup-output
-          path: dedup-output.tar.gz
+          name: ia-ready-output
+          path: ia-ready.tar.gz
           retention-days: 1
-
-  github-release-upload:
-    needs: collect-matrix-outputs
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
-      - uses: actions/download-artifact@v4
-        continue-on-error: true
-        with:
-          name: dedup-output
-          path: .
-
-      - name: Extract
-        run: tar -I pigz -xf dedup-output.tar.gz || echo "No archive found"
-
-      - name: 🚀 Publish to GitHub Releases
-        env:
-          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
-          TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
-          REPO: '${{ github.repository }}'
-        run: |
-          TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
-          gh release create "$TAG" \
-            --repo "$REPO" \
-            --title "AWEC Matrix Run $(date +'%Y%m%d_%H%M%S')" \
-            --notes "${TOTAL} total links archived." \
-            --target main || echo "Release exists"
-
-          if [ -d "final_shards" ]; then
-            cd final_shards
-            for f in links_part_*.db; do
-              if [ -f "$f" ]; then
-                gh release upload "$TAG" "$f" --repo "../$REPO" --clobber &
-                sleep 1
-              fi
-            done
-            cd ..
-          fi
-
-          if [ -f links.txt ]; then
-            gh release upload "$TAG" links.txt --repo "$REPO" --clobber &
-          fi
-          if [ -f top_seeds.txt ]; then
-            gh release upload "$TAG" top_seeds.txt --repo "$REPO" --clobber &
-          fi
-          wait
 
   internet-archive-upload:
     needs: collect-matrix-outputs
@@ -351,14 +344,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+      
       - uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: dedup-output
+          name: ia-ready-output
           path: .
 
       - name: Extract
-        run: tar -I pigz -xf dedup-output.tar.gz || echo "No archive found"
+        run: |
+          mkdir -p ia_package
+          tar -I pigz -xf ia-ready.tar.gz -C ia_package || echo "No archive found"
 
       - name: 📤 Publish to Internet Archive
         env:
@@ -372,13 +368,11 @@ jobs:
 
           if [ -d "ia_package" ]; then
             cd ia_package
-            # Ուղարկում է 1 մեծ արխիվացված բազաների ֆայլը, մեծ միացյալ links.txt-ն և seeds-ը
             for f in *; do
               if [ -f "$f" ]; then
                 ia upload "$IA_ID" "$f" --retries 5 &
                 sleep 1
               fi
             done
-            cd ..
+            wait
           fi
-          wait
