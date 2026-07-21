@@ -280,6 +280,11 @@ jobs:
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
+      - name: 🧹 Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          sudo docker system prune --all --force || true
+          df -h
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz gh
 
       - name: 📥 Download Shard Artifacts
@@ -352,6 +357,11 @@ jobs:
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
+      - name: 🧹 Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          sudo docker system prune --all --force || true
+          df -h
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
       
       - name: 📥 Download Shard Artifacts
