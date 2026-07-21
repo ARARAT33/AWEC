@@ -416,7 +416,7 @@ jobs:
             echo "✅ Internet Archive Direct Upload Finished Successfully!"
           fi
 
-  trigger-next-run:
+trigger-next-run:
     needs: spider-matrix
     if: always() # 🔥 Անպայման կանչում է նոր run-ը
     runs-on: ubuntu-latest
@@ -429,9 +429,19 @@ jobs:
         run: |
           echo "🔄 Dispatching request for the next execution cycle..."
           sleep 5
-          curl -X POST \
+          
+          # 💡 Գրեք ձեր GitHub Actions YAML ֆայլի իրական անունը (օրինակ՝ main.yml կամ spider.yml)
+          WORKFLOW_FILE="awec-247.yml" 
+          
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
             -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/$REPO/actions/workflows/${{ github.workflow_id }}/dispatches" \
-            -d '{"ref":"main"}'
-          echo "✅ Continuous execution loop successfully re-triggered!"
+            "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
+            -d '{"ref":"main"}')
+            
+          echo "HTTP Response Code: $RESPONSE"
+          if [ "$RESPONSE" -eq 204 ]; then
+            echo "✅ Continuous execution loop successfully re-triggered!"
+          else
+            echo "⚠️ Failed to trigger next run. Check workflow filename and permissions."
+          fi
