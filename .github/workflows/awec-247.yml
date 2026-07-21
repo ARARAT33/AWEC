@@ -1,4 +1,4 @@
-name: AWEC – 13-Job Matrix Spiders
+name: AWEC – Ultra-Fast High-Precision Matrix Spiders
 
 on:
   push:
@@ -9,12 +9,14 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 env:
   MATRIX_SIZE: 10
-  CRAWL_TIME_SEC: 3000 # 5 ժամվա փոխարեն սարքեցինք 50 րոպե (3000 վայրկյան)
+  CRAWL_TIME_SEC: 3000 # 50 րոպե
   MAX_DB_SIZE: 1900000000
   DEDUP_BATCH: 1000000
+  PYTHONUNBUFFERED: "1" # Real-time Python logs output
 
 jobs:
   prepare-shards:
@@ -25,9 +27,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq sqlite3 pigz
 
-      - name: Create Clean Skeletal Shards Quickly
+      - name: ⚡ Ultra Fast Skeletal Shards Creation
         run: |
           python3 << 'PYEOF'
           import sqlite3, os
@@ -37,10 +39,13 @@ jobs:
               name = f"initial_shards/initial_shard_{i:04d}.db"
               conn = sqlite3.connect(name)
               conn.execute("PRAGMA journal_mode=WAL")
+              conn.execute("PRAGMA page_size=65536")
+              conn.execute("PRAGMA mmap_size=30000000000")
               conn.execute("CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)")
               conn.commit()
               conn.close()
-          print(f"✅ Skeletal {N} shards initialized.")
+              print(f"[{i+1}/{N}] Initialized shard database: {name}", flush=True)
+          print(f"✅ High-performance {N} skeletal shards created successfully.", flush=True)
           PYEOF
 
       - uses: actions/upload-artifact@v4
@@ -52,7 +57,7 @@ jobs:
   spider-matrix:
     needs: prepare-shards
     runs-on: ubuntu-latest
-    timeout-minutes: 60 # Սահմանափակեցինք աշխատանքը առավելագույնը 1 ժամով
+    timeout-minutes: 60
     concurrency:
       group: awec_spiders_lock_shard_${{ matrix.shard }}
       cancel-in-progress: false
@@ -63,13 +68,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free Disk Space
+      - name: 🧹 Maximize Free Disk Space & RAM
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf "/usr/local/share/boost"
-          sudo docker system prune --all --force
+          echo "🧹 Cleaning background runner bloat to max out SSD space..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          sudo docker system prune --all --force || true
+          df -h
 
       - uses: actions/setup-python@v5
         with:
@@ -91,6 +95,7 @@ jobs:
           FILE="initial_shards/initial_shard_${SHARD_STR}.db"
           echo "DB_FILE=$FILE" >> $GITHUB_OUTPUT
           echo "SHARD_STR=$SHARD_STR" >> $GITHUB_OUTPUT
+          echo "📍 Assigned Shard Index: ${{ matrix.shard }} -> File: $FILE"
 
       - name: Restore checkpoint if exists
         continue-on-error: true
@@ -102,7 +107,10 @@ jobs:
       - name: Extract checkpoint
         run: |
           if [ -f checkpoint.tar.gz ]; then
-            tar -I pigz -xf checkpoint.tar.gz && echo "🔄 Checkpoint restored"
+            echo "🔄 Restoring checkpoint archive..."
+            tar -I pigz -xf checkpoint.tar.gz && echo "✅ Checkpoint restored successfully!"
+          else
+            echo "ℹ️ No previous checkpoint found. Starting fresh run for this shard."
           fi
 
       - name: 📥 Shard Independent Download
@@ -114,13 +122,12 @@ jobs:
           SHARD_IDX: ${{ matrix.shard }}
         run: |
           mkdir -p shard_data
+          echo "🔍 Fetching previous release assets for shard continuation..."
           RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             "https://api.github.com/repos/${{ github.repository }}/releases/latest")
           
           if [ -n "$RESPONSE" ] && ! echo "$RESPONSE" | jq -e '.message' >/dev/null 2>&1; then
-            PART_NUM=$((SHARD_IDX + 1))
-            TARGET_PART=$(printf "links_part_%04d.db" $PART_NUM)
-            ASSETS=$(echo "$RESPONSE" | jq -r --arg target "$TARGET_PART" '.assets[]? | objects | select(.name == $target or .name == "top_seeds.txt") | "\(.browser_download_url) \(.name)"')
+            ASSETS=$(echo "$RESPONSE" | jq -r '.assets[]? | objects | select(.name | contains("links_part_") or contains("top_seeds")) | "\(.browser_download_url) \(.name)"')
             
             if [ -n "$ASSETS" ] && [ "$ASSETS" != "null" ]; then
               cd shard_data
@@ -129,7 +136,10 @@ jobs:
                   echo "$url" >> dls.txt
                 fi
               done
-              [ -f dls.txt ] && aria2c -x4 -s4 -j4 -i dls.txt --console-log-level=warn || echo "Nothing for this shard"
+              if [ -f dls.txt ]; then
+                echo "🚀 Downloading seed databases via aria2c..."
+                aria2c -x16 -s16 -j8 -i dls.txt --console-log-level=warn || true
+              fi
               cd ..
             fi
           fi
@@ -146,55 +156,61 @@ jobs:
           shard_idx = int(os.environ['SHARD_IDX'])
           total_shards = int(os.environ['TOTAL_SHARDS'])
           
+          print(f"⚡ Merging previous assets into active database: {db_file}", flush=True)
           conn = sqlite3.connect(db_file)
           conn.execute("PRAGMA journal_mode=MEMORY")
           conn.execute("PRAGMA synchronous=OFF")
-          conn.execute("PRAGMA cache_size=-20000")
+          conn.execute("PRAGMA cache_size=-131072") # 128MB RAM Cache
+          conn.execute("PRAGMA mmap_size=30000000000")
           
           old_dbs = [f for f in os.listdir("shard_data") if f.endswith(".db")] if os.path.isdir("shard_data") else []
-          if old_dbs:
-              old_db_path = os.path.join("shard_data", old_dbs[0])
-              print(f"Merging legacy shard asset: {old_db_path}")
-              src = sqlite3.connect(f"file:{old_db_path}?mode=ro", uri=True)
-              cursor = src.cursor()
-              cursor.execute("SELECT url FROM urls")
-              while True:
-                  rows = cursor.fetchmany(50000)
-                  if not rows: break
-                  conn.executemany("INSERT OR IGNORE INTO urls VALUES (?)", rows)
-              src.close()
+          for idx, old_db in enumerate(old_dbs):
+              old_db_path = os.path.join("shard_data", old_db)
+              print(f"  [{idx+1}/{len(old_dbs)}] Merging database asset: {old_db_path}", flush=True)
+              try:
+                  src = sqlite3.connect(f"file:{old_db_path}?mode=ro", uri=True)
+                  cursor = src.cursor()
+                  cursor.execute("SELECT url FROM urls")
+                  count = 0
+                  while True:
+                      rows = cursor.fetchmany(100000)
+                      if not rows: break
+                      conn.executemany("INSERT OR IGNORE INTO urls VALUES (?)", rows)
+                      count += len(rows)
+                      print(f"    -> Integrated {count} URLs...", flush=True)
+                  src.close()
+              except Exception as e:
+                  print(f"  ⚠️ Skipping corrupt or unreadable asset {old_db}: {e}", flush=True)
           
-          seeds_path = "shard_data/top_seeds.txt"
-          if os.path.exists(seeds_path):
-              print(f"Slicing top_seeds.txt specifically for shard {shard_idx}...")
-              with open(seeds_path, "r", encoding="utf-8") as f:
-                  for idx, line in enumerate(f):
-                      if idx % total_shards == shard_idx:
-                          url = line.strip()
-                          if url:
-                              conn.execute("INSERT OR IGNORE INTO urls VALUES (?)", (url,))
-                              
           conn.commit()
           conn.close()
+          print("✅ Asset integration process finished.", flush=True)
           PYEOF
 
-      - name: 🕷️ Run Spider
+      - name: 🕷️ Run High-Speed Spider
         env:
           DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
           SHARD_INDEX: ${{ matrix.shard }}
           TOTAL_SHARDS: ${{ env.MATRIX_SIZE }}
         run: |
+          echo "🕷️ Launching Collector 24/7 for Shard ${{ matrix.shard }}..."
           python collector_247.py \
             --db "$DB_FILE" \
             --shard-index "$SHARD_INDEX" \
             --total-shards "$TOTAL_SHARDS" &
           SPIDER_PID=$!
+          
+          echo "⏱️ Crawler timer active: running for $CRAWL_TIME_SEC seconds (PID: $SPIDER_PID)..."
           sleep $CRAWL_TIME_SEC &
           SLEEP_PID=$!
+          
           wait -n $SLEEP_PID $SPIDER_PID || true
+          
           if kill -0 $SPIDER_PID 2>/dev/null; then
+            echo "🛑 Time limit reached. Sending graceful SIGINT to spider process..."
             kill -INT $SPIDER_PID
             wait $SPIDER_PID 2>/dev/null || true
+            echo "✅ Spider process terminated cleanly."
           fi
 
       - name: 💾 Pack checkpoint on failure
@@ -202,6 +218,7 @@ jobs:
         id: save_ckpt
         run: |
           if [ -d "checkpoints" ]; then
+            echo "📦 Packing emergency checkpoint archive..."
             tar -I pigz -cf checkpoint.tar.gz checkpoints
             echo "CHECKPOINT_READY=true" >> $GITHUB_OUTPUT
           fi
@@ -213,7 +230,7 @@ jobs:
           path: checkpoint.tar.gz
           retention-days: 1
 
-      - name: 📦 Prepare spider output
+      - name: 📦 Prepare Output Archive
         if: always()
         env:
           DB_FILE: ${{ steps.find_db.outputs.DB_FILE }}
@@ -224,20 +241,30 @@ jobs:
           import sqlite3, os
           db_file = os.environ['DB_FILE']
           shard_index = os.environ['SHARD_INDEX']
+          print(f"📦 Extracting collected URLs to text dump for Shard {shard_index}...", flush=True)
+          
           conn = sqlite3.connect(db_file)
           c = conn.cursor()
           c.execute('CREATE TABLE IF NOT EXISTS urls (url TEXT PRIMARY KEY)')
           conn.commit()
           c.execute('SELECT url FROM urls')
-          with open(f'output/links_{shard_index}.txt', 'w', encoding="utf-8") as f:
+          
+          out_file = f'output/links_{shard_index}.txt'
+          total = 0
+          with open(out_file, 'w', encoding="utf-8") as f:
               while True:
-                  rows = c.fetchmany(50000)
+                  rows = c.fetchmany(100000)
                   if not rows: break
                   f.writelines(row[0] + '\n' for row in rows)
+                  total += len(rows)
+                  print(f"  -> Dumped {total} URLs into {out_file}", flush=True)
           conn.close()
           PYEOF
+          
           cp "$DB_FILE" output/spider_$SHARD_INDEX.db
+          echo "📦 Compress spider outputs with parallel pigz..."
           tar -I pigz -cf spider-output.tar.gz -C output .
+          echo "✅ Output archive spider-output.tar.gz ready."
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -250,117 +277,118 @@ jobs:
     needs: spider-matrix
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz gh
 
-      - name: 📥 Download all shard artifacts
+      - name: 📥 Download Shard Artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: spider-output-shard-*
           path: raw_shards
 
-      - name: 📦 Prepare Shards for Release
+      - name: 📦 Format File Names with 64-bit High-Precision Timestamp
         run: |
           mkdir -p release_files
-          find raw_shards -name "*.tar.gz" -exec tar -I pigz -xf {} -C release_files \;
+          echo "📂 Unpacking raw shard outputs..."
+          find raw_shards -name "*.tar.gz" -exec tar -I pigz -xf {} -C release_files \; 2>/dev/null || true
           
           cd release_files
-          cat links_*.txt > links.txt 2>/dev/null || true
-          cat links_*.txt 2>/dev/null | head -n 50000 > top_seeds.txt || true
+          echo "🔗 Merging text links across all available shards..."
+          cat links_*.txt > combined_links.txt 2>/dev/null || true
+          cat combined_links.txt 2>/dev/null | head -n 50000 > combined_top_seeds.txt || true
+          
+          # 64-bit nanosecond-precision timestamp generation (Format: DD-MM-YYYY_HH-MM-SS_Nanoseconds)
+          NANO_TIME=$(date +'%d-%m-%Y_%H-%M-%S_%N')
+          echo "⏱️ Generated High-Precision Timestamp Identifier: $NANO_TIME"
           
           for f in spider_*.db; do
             if [ -f "$f" ]; then
               num=$(echo "$f" | grep -o -E '[0-9]+')
               formatted_idx=$(printf "%04d" $((num + 1)))
-              mv "$f" "links_part_${formatted_idx}.db"
+              TARGET="links_part_${formatted_idx}_${NANO_TIME}.db"
+              mv "$f" "$TARGET"
+              echo "  -> Prepared DB: $TARGET"
             fi
           done
+          
+          if [ -f "combined_links.txt" ]; then
+            mv combined_links.txt "links_${NANO_TIME}.txt"
+          fi
+          if [ -f "combined_top_seeds.txt" ]; then
+            mv combined_top_seeds.txt "top_seeds_${NANO_TIME}.txt"
+          fi
 
-      - name: 🚀 Publish to GitHub Releases
+      - name: 🚀 Ultra-Fast Parallel GitHub Release Upload
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
           TAG: 'v-${{ github.run_id }}-${{ github.run_attempt }}'
           REPO: '${{ github.repository }}'
         run: |
           cd release_files
-          TOTAL=$(wc -l < links.txt 2>/dev/null || echo 0)
+          echo "🚀 Creating GitHub Release $TAG..."
           gh release create "$TAG" \
             --repo "$REPO" \
-            --title "AWEC Matrix Run $(date +'%Y%m%d_%H%M%S')" \
-            --notes "${TOTAL} total links archived." \
-            --target main || echo "Release exists"
+            --title "AWEC Matrix Run $(date +'%d-%m-%Y %H:%M:%S')" \
+            --notes "Archived via 64-bit Nanosecond Precision System" \
+            --target main || echo "Release tag already exists, skipping creation."
 
-          for f in links_part_*.db; do
+          echo "📤 Uploading files in background parallel streams..."
+          for f in *; do
             if [ -f "$f" ]; then
+              echo "  -> [Background Upload] $f..."
               gh release upload "$TAG" "$f" --repo "$REPO" --clobber &
-              sleep 1
             fi
           done
-          
-          if [ -f links.txt ]; then
-            gh release upload "$TAG" links.txt --repo "$REPO" --clobber &
-          fi
-          if [ -f top_seeds.txt ]; then
-            gh release upload "$TAG" top_seeds.txt --repo "$REPO" --clobber &
-          fi
           wait
+          echo "✅ All GitHub Release uploads finished!"
 
-  collect-matrix-outputs:
+  internet-archive-upload:
     needs: spider-matrix
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
-
-      - name: 📥 Download all shard artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: spider-output-shard-*
-          path: raw_shards
-
-      - name: 📦 Process Files for IA
-        run: |
-          mkdir -p extracted ia_package
-          find raw_shards -name "*.tar.gz" -exec tar -I pigz -xf {} -C extracted \;
-          
-          cat extracted/links_*.txt > ia_package/links.txt 2>/dev/null || true
-          cat extracted/links_*.txt 2>/dev/null | head -n 50000 > ia_package/top_seeds.txt || true
-          
-          tar -I pigz -cf ia_package/all_matrix_shards.tar.gz -C extracted .
-          tar -I pigz -cf ia-ready.tar.gz -C ia_package .
-
-      - name: 📤 Upload IA ready results
-        uses: actions/upload-artifact@v4
-        with:
-          name: ia-ready-output
-          path: ia-ready.tar.gz
-          retention-days: 1
-
-  internet-archive-upload:
-    needs: collect-matrix-outputs
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq pigz
       
-      - uses: actions/download-artifact@v4
+      - name: 📥 Download Shard Artifacts
+        uses: actions/download-artifact@v4
         continue-on-error: true
         with:
-          name: ia-ready-output
-          path: .
+          pattern: spider-output-shard-*
+          path: raw_shards
 
-      - name: Extract
+      - name: 📦 Format File Names with 64-bit High-Precision Timestamp
         run: |
-          mkdir -p ia_package
-          tar -I pigz -xf ia-ready.tar.gz -C ia_package || echo "No archive found"
+          mkdir -p ia_upload_dir
+          find raw_shards -name "*.tar.gz" -exec tar -I pigz -xf {} -C ia_upload_dir \; 2>/dev/null || true
+          
+          cd ia_upload_dir
+          cat links_*.txt > combined_links.txt 2>/dev/null || true
+          cat combined_links.txt 2>/dev/null | head -n 50000 > combined_top_seeds.txt || true
+          
+          # 64-bit nanosecond-precision timestamp generation (Format: DD-MM-YYYY_HH-MM-SS_Nanoseconds)
+          NANO_TIME=$(date +'%d-%m-%Y_%H-%M-%S_%N')
+          
+          for f in spider_*.db; do
+            if [ -f "$f" ]; then
+              num=$(echo "$f" | grep -o -E '[0-9]+')
+              formatted_idx=$(printf "%04d" $((num + 1)))
+              mv "$f" "links_part_${formatted_idx}_${NANO_TIME}.db"
+            fi
+          done
+          
+          if [ -f "combined_links.txt" ]; then
+            mv combined_links.txt "links_${NANO_TIME}.txt"
+          fi
+          if [ -f "combined_top_seeds.txt" ]; then
+            mv combined_top_seeds.txt "top_seeds_${NANO_TIME}.txt"
+          fi
 
-      - name: 📤 Publish to Internet Archive
+      - name: 📤 High-Speed Parallel Internet Archive Direct S3 Upload
         env:
           IA_ACCESS_KEY: '${{ secrets.IA_ACCESS_KEY }}'
           IA_SECRET_KEY: '${{ secrets.IA_SECRET_KEY }}'
@@ -370,33 +398,40 @@ jobs:
           mkdir -p ~/.config
           printf "[s3]\naccess = %s\nsecret = %s\n" "$IA_ACCESS_KEY" "$IA_SECRET_KEY" > ~/.config/ia.ini
 
-          # Ընթացիկ ժամանակային դրոշմ՝ ՏարիԱմիսՕր_ԺամՐոպե (Օրինակ՝ 20260721_0030)
-          TIMESTAMP=$(date +'%Y%m%d_%H%M')
-
-          shopt -s nullglob
-          if [ -d "ia_package" ]; then
-            cd ia_package
+          if [ -d "ia_upload_dir" ]; then
+            cd ia_upload_dir
             
-            # 1. Մեծ արխիվը (.tar.gz) բեռնում ենք հերթով՝ --retries 10-ով կայունության համար
-            for f in *.tar.gz; do
+            echo "🚀 Initiating Internet Archive Multi-threaded Direct S3 Upload..."
+            for f in *; do
               if [ -f "$f" ]; then
-                REMOTE_NAME="${TIMESTAMP}_${f}"
-                echo "Uploading large archive as $REMOTE_NAME..."
-                ia upload "$IA_ID" "$f" --remote-name "$REMOTE_NAME" --retries 10
-                sleep 2
+                echo "  -> Starting IA stream for $f..."
+                ia upload "$IA_ID" "$f" \
+                  --header="x-archive-queue-derive:0" \
+                  --threads=8 \
+                  --verbose \
+                  --retries=15 &
               fi
             done
-
-            # 2. Թեթև տեքստային ֆայլերը (.txt) բեռնում ենք զուգահեռ
-            for f in *.txt; do
-              if [ -f "$f" ]; then
-                REMOTE_NAME="${TIMESTAMP}_${f}"
-                echo "Uploading text metadata as $REMOTE_NAME in background..."
-                ia upload "$IA_ID" "$f" --remote-name "$REMOTE_NAME" --retries 5 &
-                sleep 1
-              fi
-            done
-            
-            # Սպասում ենք մինչև ֆոնային բեռնումները վերջնական ավարտվեն
             wait
+            echo "✅ Internet Archive Direct Upload Finished Successfully!"
           fi
+
+  trigger-next-run:
+    needs: spider-matrix
+    if: always() # 🔥 Անպայման կանչում է նոր run-ը
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 🚀 Automatically Trigger Next Work Run Always
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          REPO: '${{ github.repository }}'
+        run: |
+          echo "🔄 Dispatching request for the next execution cycle..."
+          sleep 5
+          curl -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/$REPO/actions/workflows/${{ github.workflow_id }}/dispatches" \
+            -d '{"ref":"main"}'
+          echo "✅ Continuous execution loop successfully re-triggered!"
