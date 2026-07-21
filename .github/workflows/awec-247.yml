@@ -416,7 +416,7 @@ jobs:
             echo "✅ Internet Archive Direct Upload Finished Successfully!"
           fi
 
-trigger-next-run:
+  trigger-next-run:
     needs: spider-matrix
     if: always() # 🔥 Անպայման կանչում է նոր run-ը
     runs-on: ubuntu-latest
