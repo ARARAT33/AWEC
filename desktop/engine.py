@@ -150,7 +150,6 @@ class Engine(QObject):
         key = f"files/{site}/{gid}_{fn}"
         ok = await self.ia_put(body, key, ctype)
 
-        # Zero / Quota storage handling
         max_mb = getattr(self.cfg, "max_local_storage_mb", 50)
         purge_after = getattr(self.cfg, "purge_local_files_after_upload", True)
 
@@ -177,7 +176,9 @@ class Engine(QObject):
         raw = raw.strip()
         if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
             return None
-        u = urldefrag(urljoin(base, raw))[0]
+        if not raw.startswith(("http://", "https://")):
+            raw = "https://" + raw
+        u = urldefrag(urljoin(base if base.startswith(("http://", "https://")) else "https://" + base, raw))[0]
         p = urlparse(u)
         return u[:4000] if p.scheme in ("http", "https") and p.netloc else None
 
@@ -204,6 +205,7 @@ class Engine(QObject):
                     rp = None
                 robots[host] = rp
             if robots[host] is not None and not robots[host].can_fetch("AWEC/3.0", url):
+                self.log.emit(f"🚫 Blocked by robots.txt: {url}")
                 return
 
         retries = getattr(self.cfg, "max_retries", 3)
@@ -216,6 +218,7 @@ class Engine(QObject):
                     body = await r.read()
                     final = str(r.url)
                     self.fetched += 1
+                    self.log.emit(f"🌐 [{r.status}] {final} ({len(body)} bytes)")
                     self.save_url(final, depth, source, r.status, ctype, len(body))
                     if "text/html" in ctype.lower():
                         text = body.decode(r.charset or "utf-8", errors="ignore")
@@ -229,7 +232,8 @@ class Engine(QObject):
                             max_urls = getattr(self.cfg, "max_urls", 0)
                             same_domain = getattr(self.cfg, "same_domain_only", False)
                             if depth < max_depth and u not in seen and (not max_urls or len(seen) < max_urls):
-                                if same_domain and urlparse(u).netloc.lower() not in {urlparse(x).netloc.lower() for x in self.cfg.seeds}:
+                                seed_netlocs = {urlparse(x if x.startswith(('http://','https://')) else 'https://'+x).netloc.lower() for x in self.cfg.seeds}
+                                if same_domain and urlparse(u).netloc.lower() not in seed_netlocs:
                                     continue
                                 seen.add(u)
                                 await q.put((u, depth + 1, final))
@@ -271,12 +275,18 @@ class Engine(QObject):
         host_next = {}
         robots = {}
 
+        self.log.emit(f"🌱 Seeds provided: {self.cfg.seeds}")
         for s in self.cfg.seeds:
             u = self.normalize(s, s)
             if u and u not in seen:
                 seen.add(u)
                 await q.put((u, 0, "seed"))
                 self.enqueued += 1
+                self.log.emit(f"➕ Enqueued seed: {u}")
+
+        if q.empty():
+            self.log.emit("⚠️ No valid seeds found to enqueue.")
+            return
 
         ua_rotation = getattr(self.cfg, "ua_rotation_enabled", True)
         base_ua = getattr(self.cfg, "custom_user_agent", "AWEC/3.0 (+https://github.com/ARARAT33/AWEC)")
@@ -304,7 +314,6 @@ class Engine(QObject):
         timeout = getattr(self.cfg, "request_timeout", 30)
         verify_ssl = getattr(self.cfg, "verify_ssl", True)
         conn = aiohttp.TCPConnector(limit=max(16, workers * 2), ssl=verify_ssl)
-
         cookie_jar = aiohttp.CookieJar() if getattr(self.cfg, "cookie_jar_enabled", True) else None
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), headers=headers, connector=conn, cookie_jar=cookie_jar) as session:
@@ -313,17 +322,17 @@ class Engine(QObject):
                     while getattr(self, "is_paused", False) and not self.stop_event.is_set():
                         await asyncio.sleep(0.2)
                     try:
-                        item = await asyncio.wait_for(q.get(), 1)
+                        item = await asyncio.wait_for(q.get(), 0.5)
                     except asyncio.TimeoutError:
                         if q.empty() and self.active == 0:
                             return
                         continue
 
-                    self.active += 1  # Increment active count IMMEDIATELY upon popping item
+                    self.active += 1
                     try:
                         await self.fetch(session, item, q, seen, host_next, robots)
                     finally:
-                        self.active -= 1  # Decrement active count in finally block
+                        self.active -= 1
                         q.task_done()
                         self.emit()
 
