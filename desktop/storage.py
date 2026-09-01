@@ -23,7 +23,6 @@ class LocalSink:
         if self.max_bytes < 0:
             return
         if self.max_bytes == 0:
-            # Zero storage: delete all downloaded files in fallback directory
             if self.root.exists():
                 for p in self.root.rglob('*'):
                     if p.is_file():
@@ -33,14 +32,13 @@ class LocalSink:
                             pass
             return
 
-        # Enforce quota by removing oldest files if size > max_bytes
         files = []
         if self.root.exists():
             for p in self.root.rglob('*'):
                 if p.is_file():
                     files.append((p.stat().st_mtime, p.stat().st_size, p))
 
-        files.sort(key=lambda x: x[0])  # oldest first
+        files.sort(key=lambda x: x[0])
         current_size = sum(f[1] for f in files)
 
         for mtime, size, p in files:
@@ -54,7 +52,7 @@ class LocalSink:
 
     def put(self, domain: str, url: str, data: bytes) -> str | None:
         if self.max_bytes == 0:
-            return None  # Zero storage mode: do not save to disk
+            return None
 
         self.enforce_quota()
         digest = hashlib.sha256(url.encode()).hexdigest()[:16]
@@ -73,11 +71,18 @@ class InternetArchiveSink:
             's3',
             aws_access_key_id=access_key,
             aws_secret_access_key=secret_key,
-            endpoint_url=endpoint_url,
+            endpoint_url=endpoint_url or "https://s3.us.archive.org",
             region_name='us-east-1'
         )
         self.bucket = bucket
 
     def put(self, key: str, data: bytes, content_type: str = 'application/octet-stream') -> str:
-        self.client.put_object(Bucket=self.bucket, Key=key, Body=data, ContentType=content_type)
+        body_bytes = bytes(data)
+        file_len = len(body_bytes)
+        self.client.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=body_bytes,
+            ContentType=content_type or 'application/octet-stream'
+        )
         return key
