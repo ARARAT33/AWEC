@@ -1,0 +1,14 @@
+AWEC built-in language index
+
+1. en - English (base)
+2. hy - Հայերեն
+3. ru - Русский
+4. es - Español
+5. fr - Français
+6. de - Deutsch
+7. pt - Português
+8. it - Italiano
+9. zh - 中文
+10. ja - 日本語
+
+Custom language packs use the .awec.language format documented in README.md.
