@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Modern AWEC desktop launcher.
-Run with: python -m desktop.launcher
-"""
+"""AWEC Desktop entry point."""
 from PySide6.QtWidgets import QApplication
 from .theme import apply_theme
-from .app_window import AWECMainWindow
+from .app_window_v2 import AWECMainWindow
+
 
 def main():
     app = QApplication.instance() or QApplication([])
@@ -12,6 +11,7 @@ def main():
     window = AWECMainWindow()
     window.show()
     return app.exec()
+
 
 if __name__ == '__main__':
     raise SystemExit(main())
