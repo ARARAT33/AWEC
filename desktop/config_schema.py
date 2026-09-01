@@ -26,10 +26,19 @@ class AWECConfig:
     request_timeout: int = 30
     retry_backoff_factor: float = 2.0
 
-    # Deep Anti-Blocking & Networking Settings
+    # Deep Anti-Blocking & Advanced Crawler Settings
     custom_user_agent: str = "AWEC/3.0 (+https://github.com/ARARAT33/AWEC; Archival Crawler)"
+    ua_rotation_enabled: bool = True
+    delay_jitter_sec: float = 0.25
+    cookie_jar_enabled: bool = True
+    verify_ssl: bool = True
+    auto_headers_enabled: bool = True
     proxy_url: str = ""
     custom_headers_json: str = "{\n  \"Accept-Language\": \"en-US,en;q=0.9\",\n  \"Cache-Control\": \"no-cache\"\n}"
+
+    # Zero / Quota Local Storage Management
+    max_local_storage_mb: int = 50  # 0 means store nothing locally (zero local footprint)
+    purge_local_files_after_upload: bool = True
 
     # Storage & Internet Archive S3 Settings
     destination_archive: bool = True
