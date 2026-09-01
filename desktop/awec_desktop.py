@@ -129,7 +129,7 @@ class Engine(QObject):
         for attempt in range(self.cfg.retries+1):
             try:
                 self.active+=1
-                async with session.get(url,allow_redirects=True,max_redirects=8) as r:
+                async with session.get(url,allow_redirects=True,max_redirects=8,proxy=getattr(self, "proxy_url", None)) as r:
                     ctype=r.headers.get("content-type",""); body=await r.read(); final=str(r.url); self.fetched+=1; self.save_url(final,depth,source,r.status,ctype,len(body))
                     if "text/html" in ctype.lower():
                         text=body.decode(r.charset or "utf-8",errors="ignore"); links=[]
@@ -164,7 +164,20 @@ class Engine(QObject):
         for s in self.cfg.seeds:
             u=self.normalize(s,s)
             if u and u not in seen:seen.add(u);await q.put((u,0,"seed"));self.enqueued+=1
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.cfg.timeout),headers={"User-Agent":"AWEC/3.0 (+https://github.com/ARARAT33/AWEC)"},connector=aiohttp.TCPConnector(limit=max(16,self.cfg.workers*2))) as session:
+        headers = {"User-Agent": getattr(self.cfg, "custom_user_agent", "AWEC/3.0 (+https://github.com/ARARAT33/AWEC)")}
+        custom_headers_str = getattr(self.cfg, "custom_headers_json", "")
+        if custom_headers_str:
+            try:
+                ch = json.loads(custom_headers_str)
+                if isinstance(ch, dict):
+                    headers.update({str(k): str(v) for k, v in ch.items()})
+            except Exception:
+                pass
+
+        proxy_url = getattr(self.cfg, "proxy_url", "") or None
+        self.proxy_url = proxy_url
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.cfg.timeout),headers=headers,connector=aiohttp.TCPConnector(limit=max(16,self.cfg.workers*2))) as session:
             async def worker():
                 while not self.stop_event.is_set():
                     try:item=await asyncio.wait_for(q.get(),1)
