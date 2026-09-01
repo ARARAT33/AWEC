@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from desktop.config_schema import AWECConfig
 from desktop.i18n import LANGUAGES, TRANSLATIONS, get_translation, load_language_pack
-from desktop.awec_desktop import Engine
+from desktop.engine import Engine
 
 
 class AWECMainWindow(QMainWindow):
