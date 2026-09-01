@@ -1,10 +1,11 @@
 """AWEC Modern Desktop 3.0 UI Application Window.
 
-Features complete UI rewrite:
-- Multi-tab side panel: Dashboard, Seed Sites, Crawler & Deep Settings, Storage & IA, Languages & Editor, Live Logs.
-- Dynamic translation switching for 10 languages across every widget.
-- Complete deep configuration controls (workers, depth, rate limits, proxy, user-agent, custom headers JSON, IA S3 keys, extensions).
-- Full signal integration with AWEC engine for live metrics, status badges, progress bars, and log streaming.
+Features:
+- Multi-tab navigation: Dashboard, Seed Sites, Crawler & Deep Settings, Storage & S3, Languages & Interactive Editor, Live Logs.
+- Full dynamic re-translation of every UI string when selecting or changing language.
+- Interactive key-value table editor allowing live custom naming for any button, section, label, or metric.
+- Deep anti-blocking controls (User-Agent rotation, delay jitter, cookie sessions, auto Sec-Fetch headers, SSL verify, proxy).
+- Zero / quota local storage management controls.
 """
 from __future__ import annotations
 
@@ -12,14 +13,13 @@ import json
 from pathlib import Path
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout,
-    QWidget
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget
 )
 
 from desktop.config_schema import AWECConfig
@@ -33,15 +33,14 @@ class AWECMainWindow(QMainWindow):
         self.config = AWECConfig()
         self.lang = "en"
         self.t = get_translation("en")
-        self.custom_langs: dict[str, dict[str, str]] = {}
 
         self.engine: Engine | None = None
         self.thread: QThread | None = None
         self.status_state = "stopped"
 
-        self.setWindowTitle("AWEC Desktop 3.0 — Web Archive Engine")
-        self.resize(1320, 880)
-        self.setMinimumSize(1080, 720)
+        self.setWindowTitle("AWEC Desktop 3.0 — High-Speed Web Archive Engine")
+        self.resize(1340, 900)
+        self.setMinimumSize(1080, 740)
 
         self._build_ui()
         self._retranslate_ui()
@@ -61,12 +60,12 @@ class AWECMainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(18, 22, 18, 18)
         sidebar_layout.setSpacing(10)
 
-        brand_label = QLabel("AWEC")
-        brand_label.setObjectName("brandTitle")
-        brand_sub = QLabel("Web Archive Engine 3.0")
-        brand_sub.setObjectName("brandSubtitle")
-        sidebar_layout.addWidget(brand_label)
-        sidebar_layout.addWidget(brand_sub)
+        self.brand_label = QLabel("AWEC")
+        self.brand_label.setObjectName("brandTitle")
+        self.brand_sub = QLabel("Web Archive Engine 3.0")
+        self.brand_sub.setObjectName("brandSubtitle")
+        sidebar_layout.addWidget(self.brand_label)
+        sidebar_layout.addWidget(self.brand_sub)
         sidebar_layout.addSpacing(15)
 
         self.nav_buttons: dict[str, QPushButton] = {}
@@ -96,7 +95,7 @@ class AWECMainWindow(QMainWindow):
 
         main_layout.addWidget(sidebar)
 
-        # ── Main Content Area ───────────────────────────────────
+        # ── Main Content Stack ──────────────────────────────────
         self.pages_stack = QStackedWidget()
         main_layout.addWidget(self.pages_stack, 1)
 
@@ -124,7 +123,6 @@ class AWECMainWindow(QMainWindow):
     def _build_dashboard_page(self):
         page, layout, self.dashboard_header = self._create_page_wrapper("dashboard")
 
-        # Metric Cards Grid
         grid = QGridLayout()
         grid.setSpacing(14)
         self.metric_cards: dict[str, tuple[QLabel, QLabel]] = {}
@@ -149,9 +147,8 @@ class AWECMainWindow(QMainWindow):
 
         layout.addLayout(grid)
 
-        # Current status & Live domain
         status_box = QGroupBox("Active Crawl Diagnostics")
-        self.dashboard_group_boxes = [status_box]
+        self.status_box_ref = status_box
         slayout = QFormLayout(status_box)
 
         self.domain_val_lbl = QLabel("—")
@@ -160,7 +157,6 @@ class AWECMainWindow(QMainWindow):
 
         layout.addWidget(status_box)
 
-        # Action Control Buttons
         action_layout = QHBoxLayout()
         action_layout.setSpacing(12)
 
@@ -185,7 +181,6 @@ class AWECMainWindow(QMainWindow):
 
         layout.addLayout(action_layout)
 
-        # Log preview
         self.dash_logs = QPlainTextEdit()
         self.dash_logs.setReadOnly(True)
         self.dash_logs.setMaximumHeight(180)
@@ -205,27 +200,27 @@ class AWECMainWindow(QMainWindow):
         self.site_input.setPlaceholderText("https://example.com")
         self.site_input.returnPressed.connect(self.add_seed_site)
 
-        btn_add = QPushButton("Add Site")
-        btn_add.setObjectName("primaryButton")
-        btn_add.clicked.connect(self.add_seed_site)
+        self.btn_add_site = QPushButton("Add Site")
+        self.btn_add_site.setObjectName("primaryButton")
+        self.btn_add_site.clicked.connect(self.add_seed_site)
 
         input_layout.addWidget(self.site_input, 1)
-        input_layout.addWidget(btn_add)
+        input_layout.addWidget(self.btn_add_site)
         layout.addLayout(input_layout)
 
         ctrl_layout = QHBoxLayout()
-        btn_remove = QPushButton("Remove Selected")
-        btn_remove.clicked.connect(self.remove_seed_site)
+        self.btn_remove_site = QPushButton("Remove Selected")
+        self.btn_remove_site.clicked.connect(self.remove_seed_site)
 
-        btn_clear = QPushButton("Clear All")
-        btn_clear.clicked.connect(self.site_list_widget.clear)
+        self.btn_clear_sites = QPushButton("Clear All")
+        self.btn_clear_sites.clicked.connect(self.site_list_widget.clear)
 
-        btn_import = QPushButton("Import TXT/JSON/DOCX")
-        btn_import.clicked.connect(self.import_sites_file)
+        self.btn_import_sites = QPushButton("Import TXT/JSON/DOCX")
+        self.btn_import_sites.clicked.connect(self.import_sites_file)
 
-        ctrl_layout.addWidget(btn_remove)
-        ctrl_layout.addWidget(btn_clear)
-        ctrl_layout.addWidget(btn_import)
+        ctrl_layout.addWidget(self.btn_remove_site)
+        ctrl_layout.addWidget(self.btn_clear_sites)
+        ctrl_layout.addWidget(self.btn_import_sites)
         ctrl_layout.addStretch()
 
         layout.addLayout(ctrl_layout)
@@ -242,37 +237,43 @@ class AWECMainWindow(QMainWindow):
         scroll_layout = QVBoxLayout(scroll_content)
         scroll_layout.setSpacing(16)
 
-        # General Group
-        gen_group = QGroupBox("General Crawl Settings")
-        gen_form = QFormLayout(gen_group)
+        # General Settings Group
+        self.grp_general = QGroupBox("General Crawl Settings")
+        gen_form = QFormLayout(self.grp_general)
 
         self.spin_workers = QSpinBox()
         self.spin_workers.setRange(1, 512)
         self.spin_workers.setValue(self.config.workers)
-        gen_form.addRow("Workers:", self.spin_workers)
+        self.lbl_workers = QLabel("Workers:")
+        gen_form.addRow(self.lbl_workers, self.spin_workers)
 
         self.spin_depth = QSpinBox()
         self.spin_depth.setRange(0, 100)
         self.spin_depth.setValue(self.config.max_depth)
-        gen_form.addRow("Max Depth:", self.spin_depth)
+        self.lbl_depth = QLabel("Max Depth:")
+        gen_form.addRow(self.lbl_depth, self.spin_depth)
 
         self.spin_max_urls = QSpinBox()
         self.spin_max_urls.setRange(0, 2000000000)
         self.spin_max_urls.setValue(self.config.max_urls)
-        gen_form.addRow("Max URLs (0=Unlimited):", self.spin_max_urls)
+        self.lbl_max_urls = QLabel("Max URLs:")
+        gen_form.addRow(self.lbl_max_urls, self.spin_max_urls)
 
         self.spin_delay = QDoubleSpinBox()
         self.spin_delay.setRange(0.0, 120.0)
         self.spin_delay.setDecimals(3)
         self.spin_delay.setValue(self.config.per_host_delay)
-        gen_form.addRow("Per-Host Delay (sec):", self.spin_delay)
+        self.lbl_delay = QLabel("Per-Host Delay:")
+        gen_form.addRow(self.lbl_delay, self.spin_delay)
 
         self.input_max_file = QLineEdit(str(self.config.max_file_size))
-        gen_form.addRow("Max File Size (Bytes):", self.input_max_file)
+        self.lbl_max_file = QLabel("Max File Size (Bytes):")
+        gen_form.addRow(self.lbl_max_file, self.input_max_file)
 
         self.input_ext = QPlainTextEdit(" ".join(self.config.file_types))
         self.input_ext.setMaximumHeight(60)
-        gen_form.addRow("Extensions:", self.input_ext)
+        self.lbl_ext = QLabel("Extensions:")
+        gen_form.addRow(self.lbl_ext, self.input_ext)
 
         self.chk_robots = QCheckBox("Respect robots.txt Rules")
         self.chk_robots.setChecked(self.config.respect_robots)
@@ -286,40 +287,77 @@ class AWECMainWindow(QMainWindow):
         self.chk_download_files.setChecked(self.config.download_discovered_files)
         gen_form.addRow(self.chk_download_files)
 
-        scroll_layout.addWidget(gen_group)
+        scroll_layout.addWidget(self.grp_general)
 
         # Deep Anti-Blocking & Network Group
-        net_group = QGroupBox("Anti-Blocking & Deep Network Settings")
-        net_form = QFormLayout(net_group)
+        self.grp_network = QGroupBox("Anti-Blocking & Deep Network Settings")
+        net_form = QFormLayout(self.grp_network)
 
         self.input_ua = QLineEdit(self.config.custom_user_agent)
-        net_form.addRow("User-Agent:", self.input_ua)
+        self.lbl_ua = QLabel("User-Agent:")
+        net_form.addRow(self.lbl_ua, self.input_ua)
+
+        self.chk_ua_rotation = QCheckBox("Enable Smart User-Agent Rotation Pool")
+        self.chk_ua_rotation.setChecked(self.config.ua_rotation_enabled)
+        net_form.addRow(self.chk_ua_rotation)
+
+        self.spin_jitter = QDoubleSpinBox()
+        self.spin_jitter.setRange(0.0, 30.0)
+        self.spin_jitter.setDecimals(2)
+        self.spin_jitter.setValue(self.config.delay_jitter_sec)
+        self.lbl_jitter = QLabel("Delay Jitter (sec):")
+        net_form.addRow(self.lbl_jitter, self.spin_jitter)
+
+        self.chk_cookie_jar = QCheckBox("Enable Persistent Cookie Jar Sessions")
+        self.chk_cookie_jar.setChecked(self.config.cookie_jar_enabled)
+        net_form.addRow(self.chk_cookie_jar)
+
+        self.chk_auto_headers = QCheckBox("Auto-Generate Browser Sec-Fetch & Accept Headers")
+        self.chk_auto_headers.setChecked(self.config.auto_headers_enabled)
+        net_form.addRow(self.chk_auto_headers)
+
+        self.chk_verify_ssl = QCheckBox("Verify SSL Certificates")
+        self.chk_verify_ssl.setChecked(self.config.verify_ssl)
+        net_form.addRow(self.chk_verify_ssl)
 
         self.input_proxy = QLineEdit(self.config.proxy_url)
-        self.input_proxy.setPlaceholderText("e.g. http://127.0.0.1:8080 or socks5://127.0.0.1:9050")
-        net_form.addRow("Proxy URL:", self.input_proxy)
+        self.lbl_proxy = QLabel("Proxy URL:")
+        net_form.addRow(self.lbl_proxy, self.input_proxy)
 
         self.input_headers = QPlainTextEdit(self.config.custom_headers_json)
-        self.input_headers.setMaximumHeight(80)
-        net_form.addRow("Custom Headers (JSON):", self.input_headers)
+        self.input_headers.setMaximumHeight(70)
+        self.lbl_headers = QLabel("Custom Headers (JSON):")
+        net_form.addRow(self.lbl_headers, self.input_headers)
 
         self.spin_timeout = QSpinBox()
         self.spin_timeout.setRange(1, 600)
         self.spin_timeout.setValue(self.config.request_timeout)
-        net_form.addRow("Timeout (sec):", self.spin_timeout)
+        self.lbl_timeout = QLabel("Timeout (sec):")
+        net_form.addRow(self.lbl_timeout, self.spin_timeout)
 
         self.spin_retries = QSpinBox()
         self.spin_retries.setRange(0, 20)
         self.spin_retries.setValue(self.config.max_retries)
-        net_form.addRow("Max Retries:", self.spin_retries)
+        self.lbl_retries = QLabel("Max Retries:")
+        net_form.addRow(self.lbl_retries, self.spin_retries)
 
-        self.spin_backoff = QDoubleSpinBox()
-        self.spin_backoff.setRange(1.0, 10.0)
-        self.spin_backoff.setDecimals(1)
-        self.spin_backoff.setValue(self.config.retry_backoff_factor)
-        net_form.addRow("Backoff Factor:", self.spin_backoff)
+        scroll_layout.addWidget(self.grp_network)
 
-        scroll_layout.addWidget(net_group)
+        # Local Storage Policy Group
+        self.grp_storage_policy = QGroupBox("Zero/Quota Storage Policy Settings")
+        sp_form = QFormLayout(self.grp_storage_policy)
+
+        self.spin_max_mb = QSpinBox()
+        self.spin_max_mb.setRange(0, 500000)
+        self.spin_max_mb.setValue(self.config.max_local_storage_mb)
+        self.lbl_max_mb = QLabel("Max Disk Cache (MB, 0 = Keep Nothing):")
+        sp_form.addRow(self.lbl_max_mb, self.spin_max_mb)
+
+        self.chk_purge_upload = QCheckBox("Purge Files Immediately After S3 Upload")
+        self.chk_purge_upload.setChecked(self.config.purge_local_files_after_upload)
+        sp_form.addRow(self.chk_purge_upload)
+
+        scroll_layout.addWidget(self.grp_storage_policy)
 
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
@@ -330,51 +368,59 @@ class AWECMainWindow(QMainWindow):
     def _build_storage_page(self):
         page, layout, self.storage_header = self._create_page_wrapper("storage")
 
-        ia_group = QGroupBox("Internet Archive S3 Upload Credentials")
-        ia_form = QFormLayout(ia_group)
+        self.grp_ia = QGroupBox("Internet Archive S3 Credentials")
+        ia_form = QFormLayout(self.grp_ia)
 
         self.input_collection = QLineEdit(self.config.ia_collection)
-        ia_form.addRow("IA Collection:", self.input_collection)
+        self.lbl_collection = QLabel("IA Collection:")
+        ia_form.addRow(self.lbl_collection, self.input_collection)
 
         self.input_identifier = QLineEdit(self.config.ia_identifier)
-        ia_form.addRow("IA Identifier (Bucket):", self.input_identifier)
+        self.lbl_identifier = QLabel("IA Identifier:")
+        ia_form.addRow(self.lbl_identifier, self.input_identifier)
 
         self.input_creator = QLineEdit(self.config.ia_creator)
-        ia_form.addRow("Creator:", self.input_creator)
+        self.lbl_creator = QLabel("Creator:")
+        ia_form.addRow(self.lbl_creator, self.input_creator)
 
         self.input_title = QLineEdit(self.config.ia_title)
-        ia_form.addRow("Title:", self.input_title)
+        self.lbl_title = QLabel("Title:")
+        ia_form.addRow(self.lbl_title, self.input_title)
 
         self.input_access = QLineEdit(self.config.ia_access_key)
         self.input_access.setEchoMode(QLineEdit.EchoMode.Password)
-        ia_form.addRow("S3 Access Key:", self.input_access)
+        self.lbl_access = QLabel("S3 Access Key:")
+        ia_form.addRow(self.lbl_access, self.input_access)
 
         self.input_secret = QLineEdit(self.config.ia_secret_key)
         self.input_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        ia_form.addRow("S3 Secret Key:", self.input_secret)
+        self.lbl_secret = QLabel("S3 Secret Key:")
+        ia_form.addRow(self.lbl_secret, self.input_secret)
 
         self.input_endpoint = QLineEdit(self.config.ia_endpoint)
-        ia_form.addRow("S3 Endpoint URL:", self.input_endpoint)
+        self.lbl_endpoint = QLabel("S3 Endpoint:")
+        ia_form.addRow(self.lbl_endpoint, self.input_endpoint)
 
-        layout.addWidget(ia_group)
+        layout.addWidget(self.grp_ia)
 
-        fb_group = QGroupBox("Local Fallback Directory")
-        fb_form = QFormLayout(fb_group)
+        self.grp_fallback = QGroupBox("Local Fallback Directory")
+        fb_form = QFormLayout(self.grp_fallback)
 
         fb_row = QHBoxLayout()
         self.input_fallback = QLineEdit(self.config.fallback_dir)
-        btn_browse = QPushButton("Browse")
-        btn_browse.clicked.connect(self.browse_fallback_folder)
+        self.btn_browse_fallback = QPushButton("Browse")
+        self.btn_browse_fallback.clicked.connect(self.browse_fallback_folder)
         fb_row.addWidget(self.input_fallback)
-        fb_row.addWidget(btn_browse)
+        fb_row.addWidget(self.btn_browse_fallback)
 
-        fb_form.addRow("Fallback Folder:", fb_row)
-        layout.addWidget(fb_group)
+        self.lbl_fallback = QLabel("Fallback Folder:")
+        fb_form.addRow(self.lbl_fallback, fb_row)
+        layout.addWidget(self.grp_fallback)
 
         layout.addStretch()
         self.pages_stack.addWidget(page)
 
-    # ── 5. Languages & Editor Page ──────────────────────────────
+    # ── 5. Languages & Interactive Editor Page ──────────────────
     def _build_languages_page(self):
         page, layout, self.languages_header = self._create_page_wrapper("languages")
 
@@ -387,28 +433,35 @@ class AWECMainWindow(QMainWindow):
 
         top_row.addWidget(self.combo_lang, 1)
 
-        btn_import_lang = QPushButton("Import .awec.language")
-        btn_import_lang.clicked.connect(self.import_language_file)
-        btn_save_lang = QPushButton("Save Custom Pack")
-        btn_save_lang.clicked.connect(self.export_language_file)
+        self.btn_import_lang = QPushButton("Import .awec.language")
+        self.btn_import_lang.clicked.connect(self.import_language_file)
+        self.btn_export_lang = QPushButton("Export Pack (.awec.language)")
+        self.btn_export_lang.clicked.connect(self.export_language_file)
 
-        top_row.addWidget(btn_import_lang)
-        top_row.addWidget(btn_save_lang)
+        top_row.addWidget(self.btn_import_lang)
+        top_row.addWidget(self.btn_export_lang)
         layout.addLayout(top_row)
 
-        editor_group = QGroupBox("Live Translation Pack Editor")
-        elayout = QVBoxLayout(editor_group)
+        self.grp_editor = QGroupBox("Visual Interactive Language Pack Editor")
+        elayout = QVBoxLayout(self.grp_editor)
 
-        self.editor_lang = QPlainTextEdit()
-        self.editor_lang.setPlainText(json.dumps(self.t, ensure_ascii=False, indent=2))
-        elayout.addWidget(self.editor_lang)
+        filter_row = QHBoxLayout()
+        self.input_filter_keys = QLineEdit()
+        self.input_filter_keys.setPlaceholderText("Search UI keys or labels...")
+        self.input_filter_keys.textChanged.connect(self.filter_key_table)
+        filter_row.addWidget(self.input_filter_keys)
+        elayout.addLayout(filter_row)
 
-        btn_apply_custom = QPushButton("Apply Custom Editor Changes")
-        btn_apply_custom.setObjectName("primaryButton")
-        btn_apply_custom.clicked.connect(self.apply_custom_editor)
-        elayout.addWidget(btn_apply_custom)
+        # Table Widget for Visual Key-Value Editing
+        self.table_lang = QTableWidget(0, 2)
+        self.table_lang.setHorizontalHeaderLabels(["UI Key", "Translated Label / Button Text"])
+        self.table_lang.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.table_lang.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table_lang.setColumnWidth(0, 220)
+        self.table_lang.cellChanged.connect(self.on_table_cell_changed)
+        elayout.addWidget(self.table_lang, 1)
 
-        layout.addWidget(editor_group)
+        layout.addWidget(self.grp_editor, 1)
         self.pages_stack.addWidget(page)
 
     # ── 6. Live Logs Page ───────────────────────────────────────
@@ -419,13 +472,13 @@ class AWECMainWindow(QMainWindow):
         self.full_logs.setReadOnly(True)
         layout.addWidget(self.full_logs, 1)
 
-        btn_clear_logs = QPushButton("Clear Logs")
-        btn_clear_logs.clicked.connect(self.full_logs.clear)
-        layout.addWidget(btn_clear_logs)
+        self.btn_clear_logs = QPushButton("Clear Logs")
+        self.btn_clear_logs.clicked.connect(self.full_logs.clear)
+        layout.addWidget(self.btn_clear_logs)
 
         self.pages_stack.addWidget(page)
 
-    # ── Navigation & Retranslation ──────────────────────────────
+    # ── Navigation & Dynamic Retranslation ──────────────────────
     def switch_page(self, page_key: str):
         for k, btn in self.nav_buttons.items():
             btn.setChecked(k == page_key)
@@ -441,7 +494,7 @@ class AWECMainWindow(QMainWindow):
         t = self.t
         self.setWindowTitle(t.get("title", "AWEC Desktop 3.0"))
 
-        # Navigation buttons
+        # Navigation sidebar buttons
         for k, btn in self.nav_buttons.items():
             btn.setText(t.get(k, k.title()))
 
@@ -457,13 +510,114 @@ class AWECMainWindow(QMainWindow):
         for k, (title_lbl, _) in self.metric_cards.items():
             title_lbl.setText(t.get(k, k.upper()))
 
-        # Action Buttons
+        # Dashboard buttons
         self.btn_start.setText(t.get("start", "Start Crawl"))
         self.btn_pause.setText(t.get("pause", "Pause"))
         self.btn_stop.setText(t.get("stop", "Stop Crawl"))
 
-        # Status Sidebar
+        # Sites buttons
+        self.btn_add_site.setText(t.get("add", "Add Site"))
+        self.btn_remove_site.setText(t.get("remove", "Remove Selected"))
+        self.btn_clear_sites.setText(t.get("clear", "Clear All"))
+        self.btn_import_sites.setText(t.get("import", "Import"))
+
+        # Group Titles
+        self.grp_general.setTitle(t.get("general_settings", "General Crawl Settings"))
+        self.grp_network.setTitle(t.get("network_settings", "Anti-Blocking Settings"))
+        self.grp_storage_policy.setTitle(t.get("storage_policy", "Storage Policy"))
+        self.grp_ia.setTitle(t.get("ia_settings", "Internet Archive Credentials"))
+        self.grp_fallback.setTitle(t.get("fallback", "Fallback Directory"))
+        self.grp_editor.setTitle(t.get("lang_editor", "Visual Language Editor"))
+
+        # Form Labels & Checkboxes
+        self.lbl_workers.setText(t.get("workers", "Workers:"))
+        self.lbl_depth.setText(t.get("depth", "Max Depth:"))
+        self.lbl_max_urls.setText(t.get("max_urls", "Max URLs:"))
+        self.lbl_delay.setText(t.get("delay", "Per-Host Delay:"))
+        self.lbl_max_file.setText(t.get("max_file", "Max File Size:"))
+        self.lbl_ext.setText(t.get("extensions", "Extensions:"))
+
+        self.chk_robots.setText(t.get("respect_robots", "Respect robots.txt"))
+        self.chk_same_domain.setText(t.get("same_domain", "Same Domain Only"))
+        self.chk_download_files.setText(t.get("download_files", "Download Target Files"))
+
+        self.lbl_ua.setText(t.get("user_agent", "User-Agent:"))
+        self.chk_ua_rotation.setText(t.get("ua_rotation", "Enable UA Rotation"))
+        self.lbl_jitter.setText(t.get("delay_jitter", "Delay Jitter:"))
+        self.chk_cookie_jar.setText(t.get("cookie_jar", "Persistent Cookie Jar"))
+        self.chk_auto_headers.setText(t.get("auto_headers", "Auto Sec-Fetch Headers"))
+        self.chk_verify_ssl.setText(t.get("verify_ssl", "Verify SSL"))
+        self.lbl_proxy.setText(t.get("proxy", "Proxy URL:"))
+        self.lbl_headers.setText(t.get("custom_headers", "Custom Headers (JSON):"))
+        self.lbl_timeout.setText(t.get("timeout", "Timeout (sec):"))
+        self.lbl_retries.setText(t.get("retries", "Max Retries:"))
+
+        self.lbl_max_mb.setText(t.get("max_local_mb", "Max Local Storage (MB):"))
+        self.chk_purge_upload.setText(t.get("purge_after_upload", "Purge After Upload"))
+
+        self.lbl_collection.setText(t.get("collection", "IA Collection:"))
+        self.lbl_identifier.setText(t.get("identifier", "IA Identifier:"))
+        self.lbl_creator.setText(t.get("creator", "Creator:"))
+        self.lbl_title.setText(t.get("ia_title", "Title:"))
+        self.lbl_access.setText(t.get("access_key", "S3 Access Key:"))
+        self.lbl_secret.setText(t.get("secret_key", "S3 Secret Key:"))
+        self.lbl_endpoint.setText(t.get("endpoint", "S3 Endpoint:"))
+        self.lbl_fallback.setText(t.get("fallback", "Fallback Folder:"))
+        self.btn_browse_fallback.setText(t.get("browse", "Browse"))
+
+        self.btn_import_lang.setText(t.get("import", "Import .awec.language"))
+        self.btn_export_lang.setText(t.get("export", "Export Pack"))
+        self.btn_clear_logs.setText(t.get("clear", "Clear Logs"))
+
+        self.input_filter_keys.setPlaceholderText(t.get("filter_keys", "Search UI keys or labels..."))
+        self.table_lang.setHorizontalHeaderLabels([
+            t.get("key_name", "UI Key"),
+            t.get("key_value", "Translated Label")
+        ])
+
         self.update_status_badge(self.status_state)
+        self.populate_language_table()
+
+    # ── Interactive Language Table ─────────────────────────────
+    def populate_language_table(self):
+        self.table_lang.blockSignals(True)
+        self.table_lang.setRowCount(0)
+
+        search = self.input_filter_keys.text().lower().strip()
+        sorted_keys = sorted(self.t.keys())
+
+        for key in sorted_keys:
+            val = str(self.t[key])
+            if search and search not in key.lower() and search not in val.lower():
+                continue
+
+            row = self.table_lang.rowCount()
+            self.table_lang.insertRow(row)
+
+            key_item = QTableWidgetItem(key)
+            key_item.setFlags(key_item.flags() & ~Qt.ItemFlag.ItemIsEditable)  # Key is readonly
+            key_item.setForeground(Qt.GlobalColor.lightGray)
+
+            val_item = QTableWidgetItem(val)
+
+            self.table_lang.setItem(row, 0, key_item)
+            self.table_lang.setItem(row, 1, val_item)
+
+        self.table_lang.blockSignals(False)
+
+    def filter_key_table(self):
+        self.populate_language_table()
+
+    def on_table_cell_changed(self, row: int, col: int):
+        if col != 1:
+            return
+        key_item = self.table_lang.item(row, 0)
+        val_item = self.table_lang.item(row, 1)
+        if key_item and val_item:
+            k = key_item.text().strip()
+            v = val_item.text()
+            self.t[k] = v
+            self._retranslate_ui()
 
     # ── Actions & Slots ─────────────────────────────────────────
     def update_status_badge(self, state: str):
@@ -527,17 +681,7 @@ class AWECMainWindow(QMainWindow):
         if code in LANGUAGES:
             self.lang = code
             self.t = get_translation(code)
-            self.editor_lang.setPlainText(json.dumps(self.t, ensure_ascii=False, indent=2))
             self._retranslate_ui()
-
-    def apply_custom_editor(self):
-        try:
-            custom_data = json.loads(self.editor_lang.toPlainText())
-            self.t = custom_data
-            self._retranslate_ui()
-            QMessageBox.information(self, "AWEC", "Custom language applied successfully!")
-        except Exception as e:
-            QMessageBox.warning(self, "JSON Error", f"Invalid JSON translation format: {e}")
 
     def import_language_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -548,9 +692,8 @@ class AWECMainWindow(QMainWindow):
         try:
             pack = load_language_pack(path)
             self.t = pack
-            self.editor_lang.setPlainText(json.dumps(pack, ensure_ascii=False, indent=2))
             self._retranslate_ui()
-            QMessageBox.information(self, "AWEC", "Language pack imported and applied!")
+            QMessageBox.information(self, "AWEC", "Language pack imported and applied successfully!")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not load language pack: {e}")
 
@@ -561,7 +704,7 @@ class AWECMainWindow(QMainWindow):
         if not path:
             return
         try:
-            Path(path).write_text(self.editor_lang.toPlainText(), encoding="utf-8")
+            Path(path).write_text(json.dumps(self.t, ensure_ascii=False, indent=2), encoding="utf-8")
             QMessageBox.information(self, "AWEC", f"Saved language pack to {path}")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not save language pack: {e}")
@@ -587,11 +730,17 @@ class AWECMainWindow(QMainWindow):
             same_domain_only=self.chk_same_domain.isChecked(),
             download_discovered_files=self.chk_download_files.isChecked(),
             custom_user_agent=self.input_ua.text(),
+            ua_rotation_enabled=self.chk_ua_rotation.isChecked(),
+            delay_jitter_sec=self.spin_jitter.value(),
+            cookie_jar_enabled=self.chk_cookie_jar.isChecked(),
+            auto_headers_enabled=self.chk_auto_headers.isChecked(),
+            verify_ssl=self.chk_verify_ssl.isChecked(),
             proxy_url=self.input_proxy.text(),
             custom_headers_json=self.input_headers.toPlainText(),
             request_timeout=self.spin_timeout.value(),
             max_retries=self.spin_retries.value(),
-            retry_backoff_factor=self.spin_backoff.value(),
+            max_local_storage_mb=self.spin_max_mb.value(),
+            purge_local_files_after_upload=self.chk_purge_upload.isChecked(),
             ia_collection=self.input_collection.text(),
             ia_identifier=self.input_identifier.text(),
             ia_creator=self.input_creator.text(),
