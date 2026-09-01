@@ -1,0 +1,16 @@
+language=en
+name=English
+# AWEC base language. Add any UI key=value pairs below.
+app.title=AWEC Desktop
+status.running=AWEC Running
+status.stopped=AWEC Stopped
+button.start=Start
+button.stop=Stop
+button.pause=Pause
+button.resume=Resume
+button.settings=Settings
+button.import=Import
+button.browse=Browse
+button.save=Save
+button.cancel=Cancel
+button.custom_language=Custom language
