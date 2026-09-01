@@ -1,0 +1,33 @@
+{
+  "crawl": {
+    "follow_links": true,
+    "follow_external_domains": false,
+    "download_discovered_files": false,
+    "respect_robots_txt": true,
+    "respect_site_policies": true,
+    "workers": 32,
+    "rate_limit_per_host": 2,
+    "max_depth": 3,
+    "max_file_size_bytes": -1,
+    "file_types": [".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".webm", ".mp3", ".wav", ".pdf", ".zip", ".txt"],
+    "checkpoint_interval_seconds": 30
+  },
+  "storage": {
+    "internet_archive_enabled": true,
+    "local_folder_enabled": false,
+    "local_folder": "",
+    "upload_chunk_size_bytes": 104857600
+  },
+  "recovery": {
+    "resume_after_restart": true,
+    "retry_delays_seconds": [10, 20],
+    "max_retries": 2
+  },
+  "notifications": {
+    "notify_every_bytes": 1073741824
+  },
+  "language": {
+    "default": "en",
+    "custom_file": ""
+  }
+}
