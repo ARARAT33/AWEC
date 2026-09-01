@@ -1,0 +1,15 @@
+language=fr
+name=Français
+app.title=AWEC Desktop
+status.running=AWEC en cours
+status.stopped=AWEC arrêté
+button.start=Démarrer
+button.stop=Arrêter
+button.pause=Pause
+button.resume=Reprendre
+button.settings=Paramètres
+button.import=Importer
+button.browse=Parcourir
+button.save=Enregistrer
+button.cancel=Annuler
+button.custom_language=Langue personnalisée
