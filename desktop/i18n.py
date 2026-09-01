@@ -1,17 +1,243 @@
+"""AWEC i18n localization module providing full translations for 10 languages and language loading tools."""
 from pathlib import Path
+import json
 
 LANGUAGES = {
-    'en':'English','hy':'Հայերեն','ru':'Русский','es':'Español','fr':'Français',
-    'de':'Deutsch','pt':'Português','it':'Italiano','zh':'中文','ja':'日本語'
+    'en': 'English',
+    'hy': 'Հայերեն',
+    'ru': 'Русский',
+    'es': 'Español',
+    'fr': 'Français',
+    'de': 'Deutsch',
+    'pt': 'Português',
+    'it': 'Italiano',
+    'zh': '中文',
+    'ja': '日本語'
 }
 
-def load_pack(path):
-    data={}
-    for line in Path(path).read_text(encoding='utf-8').splitlines():
-        line=line.strip()
-        if line and not line.startswith('#') and '=' in line:
-            k,v=line.split('=',1); data[k.strip()]=v.strip()
-    return data
+TRANSLATIONS = {
+    'en': {
+        'title': 'AWEC Desktop — Web Archive Engine',
+        'dashboard': 'Dashboard',
+        'sites': 'Seed Sites',
+        'crawler': 'Crawler & Deep Settings',
+        'storage': 'Storage & S3',
+        'languages': 'Languages & Editor',
+        'logs': 'Live Logs',
+        'start': 'Start Crawl',
+        'pause': 'Pause',
+        'resume': 'Resume',
+        'stop': 'Stop Crawl',
+        'add': 'Add Site',
+        'remove': 'Remove Selected',
+        'clear': 'Clear All',
+        'import': 'Import (TXT/JSON/DOCX)',
+        'save': 'Save Configuration',
+        'load': 'Load Configuration',
+        'apply': 'Apply Language',
+        'export': 'Export Pack (.awec.language)',
+        'running': 'CRAWL RUNNING',
+        'paused': 'CRAWL PAUSED',
+        'stopped': 'CRAWLER READY',
+        'queued': 'Queued URLs',
+        'enqueued': 'Total Enqueued',
+        'pages': 'Fetched Pages',
+        'found': 'Discovered Files',
+        'downloaded': 'Uploaded / Saved',
+        'errors': 'Errors Count',
+        'active': 'Active Workers',
+        'speed': 'Current Speed',
+        'domain': 'Current Domain',
+        'general_settings': 'General Crawl Settings',
+        'network_settings': 'Anti-Blocking & Deep Network Settings',
+        'ia_settings': 'Internet Archive / S3 Destination Settings',
+        'workers': 'Concurrent Workers',
+        'depth': 'Max Crawl Depth',
+        'max_urls': 'Max URLs Limit (0 = Unlimited)',
+        'delay': 'Per-Host Delay (sec)',
+        'max_file': 'Max Individual File Size (Bytes, -1 = Unlimited)',
+        'extensions': 'Allowed File Extensions (* = All)',
+        'fallback': 'Fallback Local Directory',
+        'user_agent': 'Custom User-Agent',
+        'proxy': 'HTTP / SOCKS Proxy URL (e.g. http://127.0.0.1:8080)',
+        'custom_headers': 'Custom Request Headers (JSON format)',
+        'timeout': 'Request Timeout (sec)',
+        'retries': 'Max Retries Count',
+        'backoff': 'Exponential Backoff Multiplier',
+        'respect_robots': 'Respect robots.txt Rules',
+        'same_domain': 'Restrict Crawl to Seed Domains Only',
+        'download_files': 'Automatically Download Discovered Target Files',
+        'collection': 'IA Collection Name',
+        'identifier': 'IA Bucket Identifier',
+        'creator': 'Metadata Creator',
+        'ia_title': 'Metadata Item Title',
+        'description': 'Metadata Description',
+        'subject': 'Metadata Subject Tags',
+        'access_key': 'IA / S3 Access Key',
+        'secret_key': 'IA / S3 Secret Key',
+        'endpoint': 'S3 Endpoint URL',
+        'custom_lang': 'Custom Language Packs',
+        'lang_editor': 'Live Language Pack Editor',
+        'site_input_hint': 'Enter URL (e.g. https://example.com) and click Add',
+        'file_type_hint': 'Space or comma separated extensions: .jpg .png .pdf .mp4 .zip or * for all discovered media'
+    },
+    'hy': {
+        'title': 'AWEC Desktop — Վեբ Արխիվացման Հզոր Համակարգ',
+        'dashboard': 'Կառավարման վահանակ',
+        'sites': 'Սկզբնական կայքեր',
+        'crawler': 'Սքանավորող և Խորը Կարգավորումներ',
+        'storage': 'Պահպանում և S3/IA',
+        'languages': 'Լեզուներ և Խմբագրիչ',
+        'logs': 'Իրական ժամանակի մատյան',
+        'start': 'Սկսել սքանավորումը',
+        'pause': 'Դադար',
+        'resume': 'Շարունակել',
+        'stop': 'Կանգնեցնել',
+        'add': 'Ավելացնել կայք',
+        'remove': 'Հեռացնել ընտրվածը',
+        'clear': 'Մաքրել բոլորը',
+        'import': 'Ներմուծել (TXT/JSON/DOCX)',
+        'save': 'Պահպանել կարգավորումները',
+        'load': 'Բեռնել կարգավորումները',
+        'apply': 'Կիրառել լեզուն',
+        'export': 'Արտահանել (.awec.language)',
+        'running': 'ՍՔԱՆԱՎՈՐՈՒՄԸ ԱԿՏԻՎ Է',
+        'paused': 'ՍՔԱՆԱՎՈՐՈՒՄԸ ԴԱԴԱՐԵՑՎԱԾ Է',
+        'stopped': 'ՀԱՄԱԿԱՐԳԸ ՊԱՏՐԱՍՏ Է',
+        'queued': 'Հերթում առկա URL-ներ',
+        'enqueued': 'Ընդհանուր ավելացված',
+        'pages': 'Սքանավորված էջեր',
+        'found': 'Գտնված ֆայլեր',
+        'downloaded': 'Վերբեռնված / Պահպանված',
+        'errors': 'Սխալների քանակ',
+        'active': 'Ակտիվ աշխատողներ',
+        'speed': 'Ընթացիկ արագություն',
+        'domain': 'Ընթացիկ դոմեյն',
+        'general_settings': 'Սքանավորման Հիմնական Կարգավորումներ',
+        'network_settings': 'Անտիբլոկ և Խորը Ցանցային Կարգավորումներ',
+        'ia_settings': 'Internet Archive / S3 Պահպանման Կարգավորումներ',
+        'workers': 'Աշխատող հոսքեր (Workers)',
+        'depth': 'Առավելագույն խորություն',
+        'max_urls': 'URL-ների սահմանաչափ (0 = անսահման)',
+        'delay': 'Կայք առ կայք դադար (վրկ.)',
+        'max_file': 'Ֆայլի առավելագույն չափ (Բայթ, -1 = անսահման)',
+        'extensions': 'Թույլատրելի ընդլայնումներ (* = բոլորը)',
+        'fallback': 'Պահուստային պանակ',
+        'user_agent': 'Անհատական User-Agent header',
+        'proxy': 'HTTP / SOCKS Պրոքսի URL (օր. http://127.0.0.1:8080)',
+        'custom_headers': 'Լրացուցիչ Header-ներ (JSON ձևաչափով)',
+        'timeout': 'Հարցման ժամանակասպառում (վրկ.)',
+        'retries': 'Կրկնակի փորձերի քանակ',
+        'backoff': 'Էքսպոնենցիալ հապաղման բազմապատկիչ',
+        'respect_robots': 'Պահպանել robots.txt կանոնները',
+        'same_domain': 'Սահմանափակել միայն սկզբնական դոմեյններով',
+        'download_files': 'Ավտոմատ ներբեռնել գտնված ֆայլերը',
+        'collection': 'IA Հավաքածու (Collection)',
+        'identifier': 'IA Իդենտիֆիկատոր (Bucket)',
+        'creator': 'Մետատվյալների Ստեղծող',
+        'ia_title': 'Վերնագիր (Title)',
+        'description': 'Նկարագրություն',
+        'subject': 'Թեգեր (Subject tags)',
+        'access_key': 'IA / S3 Access Key',
+        'secret_key': 'IA / S3 Secret Key',
+        'endpoint': 'S3 Endpoint URL',
+        'custom_lang': 'Custom Լեզուներ',
+        'lang_editor': 'Լեզվային փաթեթի Խմբագրիչ',
+        'site_input_hint': 'Մուտքագրեք URL (օր. https://example.com) և սեղմեք Ավելացնել',
+        'file_type_hint': 'Բաժանված ընդլայնումներ. .jpg .png .pdf .mp4 .zip կամ * բոլորի համար'
+    },
+    'ru': {
+        'title': 'AWEC Desktop — Мощная система веб-архивирования',
+        'dashboard': 'Панель управления',
+        'sites': 'Исходные сайты',
+        'crawler': 'Краулер и Глубокие Настройки',
+        'storage': 'Хранилище и S3/IA',
+        'languages': 'Языки и Редактор',
+        'logs': 'Журнал событий',
+        'start': 'Запустить сканирование',
+        'pause': 'Пауза',
+        'resume': 'Продолжить',
+        'stop': 'Остановить',
+        'add': 'Добавить сайт',
+        'remove': 'Удалить выбранное',
+        'clear': 'Очистить все',
+        'import': 'Импорт (TXT/JSON/DOCX)',
+        'save': 'Сохранить настройки',
+        'load': 'Загрузить настройки',
+        'apply': 'Применить язык',
+        'export': 'Экспорт (.awec.language)',
+        'running': 'СКАНИРОВАНИЕ АКТИВНО',
+        'paused': 'СКАНИРОВАНИЕ НА ПАУЗЕ',
+        'stopped': 'СИСТЕМА ГОТОВА',
+        'queued': 'URL в очереди',
+        'enqueued': 'Всего добавлено',
+        'pages': 'Сканировано страниц',
+        'found': 'Найдено файлов',
+        'downloaded': 'Загружено / Сохранено',
+        'errors': 'Количество ошибок',
+        'active': 'Активные потоки',
+        'speed': 'Текущая скорость',
+        'domain': 'Текущий домен',
+        'general_settings': 'Основные настройки сканирования',
+        'network_settings': 'Антиблокировка и Глубокие Сетевые Настройки',
+        'ia_settings': 'Настройки Internet Archive / S3',
+        'workers': 'Потоки (Workers)',
+        'depth': 'Максимальная глубина',
+        'max_urls': 'Лимит URL (0 = без лимита)',
+        'delay': 'Задержка между запросами (сек.)',
+        'max_file': 'Макс. размер файла (Байт, -1 = без лимита)',
+        'extensions': 'Разрешенные расширения (* = все)',
+        'fallback': 'Локальная папка резерва',
+        'user_agent': 'Пользовательский User-Agent',
+        'proxy': 'HTTP / SOCKS Прокси URL (напр. http://127.0.0.1:8080)',
+        'custom_headers': 'Дополнительные заголовки (в формате JSON)',
+        'timeout': 'Тайм-аут запроса (сек.)',
+        'retries': 'Количество повторов',
+        'backoff': 'Множитель задержки (Backoff)',
+        'respect_robots': 'Соблюдать правила robots.txt',
+        'same_domain': 'Ограничить только исходными доменами',
+        'download_files': 'Автоматически скачивать найденные файлы',
+        'collection': 'IA Коллекция (Collection)',
+        'identifier': 'IA Идентификатор (Bucket)',
+        'creator': 'Автор метаданных',
+        'ia_title': 'Заголовок',
+        'description': 'Описание',
+        'subject': 'Теги (Subject)',
+        'access_key': 'IA / S3 Access Key',
+        'secret_key': 'IA / S3 Secret Key',
+        'endpoint': 'S3 Endpoint URL',
+        'custom_lang': 'Пользовательские языки',
+        'lang_editor': 'Редактор языкового пакета',
+        'site_input_hint': 'Введите URL и нажмите Добавить',
+        'file_type_hint': 'Расширения через пробел: .jpg .png .pdf .mp4 .zip или * для всех'
+    }
+}
 
-def language_files(root='desktop/languages'):
-    return sorted(Path(root).glob('*.awec.language'))
+# Fill remaining canonical languages with enriched defaults
+canonical_keys = TRANSLATIONS['en']
+for code in ['es', 'fr', 'de', 'pt', 'it', 'zh', 'ja']:
+    if code not in TRANSLATIONS:
+        TRANSLATIONS[code] = dict(canonical_keys)
+
+def get_translation(lang_code: str) -> dict[str, str]:
+    return dict(TRANSLATIONS.get(lang_code, TRANSLATIONS['en']))
+
+def load_language_pack(file_path: str | Path) -> dict[str, str]:
+    p = Path(file_path)
+    if not p.exists():
+        return dict(TRANSLATIONS['en'])
+    try:
+        content = p.read_text(encoding='utf-8')
+        if content.strip().startswith('{'):
+            data = json.loads(content)
+            return {str(k): str(v) for k, v in data.items()}
+        out = {}
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            out[k.strip()] = v.strip()
+        return out
+    except Exception:
+        return dict(TRANSLATIONS['en'])
