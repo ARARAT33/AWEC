@@ -1,0 +1,15 @@
+language=es
+name=Español
+app.title=AWEC Desktop
+status.running=AWEC en ejecución
+status.stopped=AWEC detenido
+button.start=Iniciar
+button.stop=Detener
+button.pause=Pausar
+button.resume=Continuar
+button.settings=Ajustes
+button.import=Importar
+button.browse=Examinar
+button.save=Guardar
+button.cancel=Cancelar
+button.custom_language=Idioma personalizado
