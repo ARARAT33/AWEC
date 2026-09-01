@@ -1,0 +1,15 @@
+language=hy
+name=Հայերեն
+app.title=AWEC Desktop
+status.running=AWEC Running
+status.stopped=AWEC Stopped
+button.start=Սկսել
+button.stop=Կանգնեցնել
+button.pause=Դադարեցնել
+button.resume=Շարունակել
+button.settings=Կարգավորումներ
+button.import=Ներմուծել
+button.browse=Ընտրել
+button.save=Պահպանել
+button.cancel=Չեղարկել
+button.custom_language=Հատուկ լեզու
