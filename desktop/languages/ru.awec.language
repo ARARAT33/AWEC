@@ -1,0 +1,15 @@
+language=ru
+name=Русский
+app.title=AWEC Desktop
+status.running=AWEC работает
+status.stopped=AWEC остановлен
+button.start=Запустить
+button.stop=Остановить
+button.pause=Пауза
+button.resume=Продолжить
+button.settings=Настройки
+button.import=Импорт
+button.browse=Обзор
+button.save=Сохранить
+button.cancel=Отмена
+button.custom_language=Пользовательский язык
