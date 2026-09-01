@@ -26,12 +26,11 @@ HREF_RE = re.compile(r"(?:href|src)\s*=\s*['\"]([^'\"]+)['\"]", re.I)
 URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.I)
 
 USER_AGENT_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:128.0) Gecko/20100101 Firefox/128.0"
 ]
 
 class Engine(QObject):
@@ -114,6 +113,10 @@ class Engine(QObject):
     async def ia_put(self, data, key, ctype):
         if not (getattr(self.cfg, "ia_access_key", "") and getattr(self.cfg, "ia_secret_key", "") and getattr(self.cfg, "ia_identifier", "")):
             return False
+
+        body_bytes = bytes(data)
+        file_size = len(body_bytes)
+
         def put():
             s3 = boto3.client(
                 "s3",
@@ -122,7 +125,14 @@ class Engine(QObject):
                 aws_secret_access_key=self.cfg.ia_secret_key,
                 region_name="us-east-1"
             )
-            s3.put_object(Bucket=self.cfg.ia_identifier, Key=key, Body=data, ContentType=ctype or "application/octet-stream")
+            # boto3 automatically sets Content-Length header for bytes/bytearrays
+            s3.put_object(
+                Bucket=self.cfg.ia_identifier,
+                Key=key,
+                Body=body_bytes,
+                ContentType=ctype or "application/octet-stream"
+            )
+
         retries = getattr(self.cfg, "max_retries", 3)
         for attempt in range(retries + 1):
             try:
@@ -174,13 +184,21 @@ class Engine(QObject):
 
     def normalize(self, base, raw):
         raw = raw.strip()
-        if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+        if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "about:")):
             return None
-        if not raw.startswith(("http://", "https://")):
-            raw = "https://" + raw
-        u = urldefrag(urljoin(base if base.startswith(("http://", "https://")) else "https://" + base, raw))[0]
-        p = urlparse(u)
-        return u[:4000] if p.scheme in ("http", "https") and p.netloc else None
+
+        # Determine correct base URL format
+        if not base.startswith(("http://", "https://")):
+            base = "https://" + base
+
+        absolute_url = urljoin(base, raw)
+        defragged = urldefrag(absolute_url)[0]
+        parsed = urlparse(defragged)
+
+        # Enforce valid HTTP/HTTPS scheme and non-empty valid netloc (e.g. rejecting wp-content:443 or host-less paths)
+        if parsed.scheme in ("http", "https") and parsed.netloc and "." in parsed.netloc:
+            return defragged[:4000]
+        return None
 
     async def fetch(self, session, item, q, seen, host_next, robots):
         url, depth, source = item
@@ -218,8 +236,14 @@ class Engine(QObject):
                     body = await r.read()
                     final = str(r.url)
                     self.fetched += 1
-                    self.log.emit(f"🌐 [{r.status}] {final} ({len(body)} bytes)")
+
+                    if r.status in (403, 503, 530):
+                        self.log.emit(f"⚠️ [{r.status}] HTTP Block/CF Challenge on {final}")
+                    else:
+                        self.log.emit(f"🌐 [{r.status}] {final} ({len(body)} bytes)")
+
                     self.save_url(final, depth, source, r.status, ctype, len(body))
+
                     if "text/html" in ctype.lower():
                         text = body.decode(r.charset or "utf-8", errors="ignore")
                         links = []
@@ -289,18 +313,16 @@ class Engine(QObject):
             return
 
         ua_rotation = getattr(self.cfg, "ua_rotation_enabled", True)
-        base_ua = getattr(self.cfg, "custom_user_agent", "AWEC/3.0 (+https://github.com/ARARAT33/AWEC)")
-        headers = {"User-Agent": random.choice(USER_AGENT_POOL) if ua_rotation else base_ua}
-
-        if getattr(self.cfg, "auto_headers_enabled", True):
-            headers.update({
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "cross-site",
-                "Upgrade-Insecure-Requests": "1"
-            })
+        base_ua = getattr(self.cfg, "custom_user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+        headers = {
+            "User-Agent": random.choice(USER_AGENT_POOL) if ua_rotation else base_ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Sec-Ch-Ua": '"Chromium";v="128", "Not=A?Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"'
+        }
 
         custom_headers_str = getattr(self.cfg, "custom_headers_json", "")
         if custom_headers_str:
