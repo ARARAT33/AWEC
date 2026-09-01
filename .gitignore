@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+AWEC/
+dataset/
+html/
+logs/
+checkpoints/
+*.db
+*.sqlite
+.env
