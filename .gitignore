@@ -9,3 +9,5 @@ checkpoints/
 *.db
 *.sqlite
 .env
+fallback/
+awec-state/
