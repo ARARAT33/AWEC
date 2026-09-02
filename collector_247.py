@@ -10,6 +10,7 @@ import asyncio
 import aiohttp
 import json
 import os
+import random
 import re
 import shutil
 import signal
@@ -19,6 +20,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
+
+from desktop.crawler_engine import USER_AGENT_POOL
 
 # ── Constants ─────────────────────────────────────────────
 LINK_PATTERN = re.compile(r'https?://[^\s<>"\'+]+', re.IGNORECASE)
@@ -197,7 +200,16 @@ class ContinuousHarvester:
             if not url:
                 continue
             try:
-                async with self.session.get(url, ssl=False, timeout=aiohttp.ClientTimeout(total=4)) as resp:
+                headers = {
+                    "User-Agent": random.choice(USER_AGENT_POOL),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "cross-site",
+                    "Upgrade-Insecure-Requests": "1"
+                }
+                async with self.session.get(url, headers=headers, ssl=False, timeout=aiohttp.ClientTimeout(total=6)) as resp:
                     if resp.status == 200:
                         text = await resp.text(errors='ignore')
                         found = LINK_PATTERN.findall(text)
@@ -211,7 +223,7 @@ class ContinuousHarvester:
                         if new_links:
                             cursor = self.db_conn.cursor()
                             cursor.executemany(
-                                "INSERT OR IGNORE INTO urls (url) VALUES (?)",
+                                "INSERT OR IGNORE INTO urls (url) VALUES (?)" ,
                                 [(l,) for l in new_links]
                             )
                             self.db_conn.commit()

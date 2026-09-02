@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import logging
 import os
+import random
 import signal
 import sys
 import uuid
@@ -20,11 +21,12 @@ from awec.archive.warc import ArchivePackageBuilder, WARCGenerator
 from awec.core.canonicalizer import CrawlPolicy, ResourceRecord, URLCanonicalizer
 from awec.core.frontier import Frontier
 from awec.discovery.parsers import ContentExtractor
-from awec.http.compression import process_payload
+from awec.http.compression import CompressionDecoder, process_payload
 from awec.http.retries import RateLimiter, parse_retry_after, calculate_backoff
 from awec.safety.policy import RobotsManager, SSRFGuard
 from awec.safety.waf import WAFDetector
 from awec.storage.state_store import StateStore
+from desktop.crawler_engine import USER_AGENT_POOL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -54,6 +56,26 @@ class EngineRunner:
             logging.warning("🛑 FORCE EXIT")
             sys.exit(1)
 
+    def build_request_headers(self, parent_url: str = "") -> dict:
+        ua = self.policy.user_agent if self.policy.user_agent else random.choice(USER_AGENT_POOL)
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,hy;q=0.8,ru;q=0.7",
+            "Accept-Encoding": CompressionDecoder.get_supported_encodings(),
+            "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none" if not parent_url else "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        if parent_url:
+            headers["Referer"] = parent_url
+        return headers
+
     async def fetch(self, session: aiohttp.ClientSession, item: dict) -> None:
         url = item["url"]
         domain = item["domain"]
@@ -76,7 +98,7 @@ class EngineRunner:
             return
 
         try:
-            req_headers = {"User-Agent": self.policy.user_agent, "Accept-Encoding": "gzip, deflate, br"}
+            req_headers = self.build_request_headers(item.get("parent_url", ""))
             async with session.get(url, headers=req_headers, allow_redirects=True, timeout=self.policy.request_timeout) as r:
                 wire_bytes = await r.read()
                 final_url = str(r.url)
