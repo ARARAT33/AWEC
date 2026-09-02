@@ -19,12 +19,21 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 USER_AGENT_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15"
+    # Chrome on Windows / macOS / Linux
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    # Firefox on Windows / macOS / Linux
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:134.0) Gecko/20100101 Firefox/134.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:134.0) Gecko/20100101 Firefox/134.0",
+    # Safari on macOS / iOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/605.1.15",
+    # Edge on Windows / macOS
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0"
 ]
 
 @dataclass
@@ -62,22 +71,27 @@ class AWECrawler:
         self.stats = {'status': 'AWEC Stopped', 'pages': 0, 'files': 0, 'bytes': 0, 'errors': 0, 'queued': 0}
         self.host_last = {}
 
-    def get_headers(self) -> dict:
-        headers = {}
-        if self.policy.ua_rotation:
-            headers["User-Agent"] = random.choice(USER_AGENT_POOL)
-        else:
-            headers["User-Agent"] = "AWEC/3.0 (+https://github.com/ARARAT33/AWEC; Archival Crawler)"
+    def get_headers(self, source_url: str = "") -> dict:
+        ua = random.choice(USER_AGENT_POOL) if self.policy.ua_rotation else "AWEC/3.0 (+https://github.com/ARARAT33/AWEC; Archival Crawler)"
+        headers = {"User-Agent": ua}
 
         if self.policy.auto_headers:
             headers.update({
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Language": "en-US,en;q=0.9,hy;q=0.8,ru;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-Site": "none" if not source_url else "same-origin",
+                "Sec-Fetch-User": "?1",
                 "Upgrade-Insecure-Requests": "1"
             })
+            if source_url:
+                headers["Referer"] = source_url
+
         if self.policy.custom_headers:
             headers.update(self.policy.custom_headers)
         return headers

@@ -27,6 +27,7 @@ from awec.http.compression import CompressionDecoder, process_payload
 from awec.safety.policy import RobotsManager, SSRFGuard
 from awec.safety.waf import WAFDetector
 from awec.storage.state_store import StateStore
+from desktop.crawler_engine import USER_AGENT_POOL
 
 APP_DIR = Path.home() / "AWEC"
 
@@ -70,6 +71,38 @@ class Engine(QObject):
         exts = [x.strip().lower() if x.strip().startswith(".") or x.strip().startswith("mime:") else f".{x.strip().lower()}" for x in exts_raw if x.strip()]
         ext = Path(urlparse(url).path.lower()).suffix
         return ext in exts or any(x.startswith("mime:") and x[5:] in ctype.lower() for x in exts)
+
+    def build_request_headers(self, source_url: str = "") -> dict:
+        ua = getattr(self.cfg, "custom_user_agent", "") or None
+        if not ua or getattr(self.cfg, "ua_rotation_enabled", True):
+            ua = random.choice(USER_AGENT_POOL)
+
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,hy;q=0.8,ru;q=0.7",
+            "Accept-Encoding": CompressionDecoder.get_supported_encodings(),
+            "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none" if not source_url else "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1"
+        }
+        if source_url and source_url != "seed":
+            headers["Referer"] = source_url
+
+        custom_json = getattr(self.cfg, "custom_headers_json", "")
+        if custom_json:
+            try:
+                ch = json.loads(custom_json)
+                if isinstance(ch, dict):
+                    headers.update(ch)
+            except Exception:
+                pass
+        return headers
 
     async def ia_put(self, body_bytes: bytes, key: str, ctype: str) -> bool:
         if not (getattr(self.cfg, "ia_access_key", "") and getattr(self.cfg, "ia_secret_key", "") and getattr(self.cfg, "ia_identifier", "")):
@@ -117,7 +150,7 @@ class Engine(QObject):
 
         for attempt in range(retries + 1):
             try:
-                headers = {"Accept-Encoding": CompressionDecoder.get_supported_encodings()}
+                headers = self.build_request_headers(source)
                 async with session.get(canonical_url, allow_redirects=True, max_redirects=8, proxy=proxy_url, headers=headers) as r:
                     ctype = r.headers.get("content-type", "").split(";")[0]
                     wire_bytes = await r.read()

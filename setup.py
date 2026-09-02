@@ -18,6 +18,7 @@ setup(
         "internetarchive>=5.0.0",
         "warcio>=1.8.0",
         "pyyaml>=6.0",
+        "requests>=2.32.0",
     ],
     entry_points={
         "console_scripts": [
