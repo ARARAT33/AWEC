@@ -160,7 +160,8 @@ class EngineRunner:
 
         except Exception as e:
             logging.error(f"❌ Error fetching {url}: {e}")
-            self.frontier.mark_failed(item_id, retry_delay=5.0)
+            delay = calculate_backoff(item.get("retry_count", 0))
+            self.frontier.mark_failed(item_id, retry_delay=delay)
         finally:
             await self.rate_limiter.release(domain)
 

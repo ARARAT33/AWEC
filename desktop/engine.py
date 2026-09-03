@@ -24,6 +24,7 @@ from awec.archive.warc import ArchivePackageBuilder, WARCGenerator
 from awec.core.canonicalizer import CrawlPolicy, ResourceRecord, URLCanonicalizer
 from awec.discovery.parsers import ContentExtractor
 from awec.http.compression import CompressionDecoder, process_payload
+from awec.http.retries import calculate_backoff, parse_retry_after
 from awec.safety.policy import RobotsManager, SSRFGuard
 from awec.safety.waf import WAFDetector
 from awec.storage.state_store import StateStore
@@ -185,22 +186,42 @@ class Engine(QObject):
                     )
                     self.store.save_resource(rec)
 
+                    if self.ext_ok(final_url, ctype):
+                        self.files_found += 1
+                        filename = Path(urlparse(final_url).path).name or "index.html"
+                        key = f"files/{host}/{rec.id[:8]}_{filename}"
+
+                        uploaded = await self.ia_put(payload.decoded_bytes, key, ctype)
+                        if uploaded:
+                            self.uploaded += 1
+                            rec.ia_item_key = key
+                            self.store.save_resource(rec)
+                        else:
+                            fallback = Path(getattr(self.cfg, "fallback_dir", "fallback")) / host
+                            fallback.mkdir(parents=True, exist_ok=True)
+                            local_path = fallback / f"{rec.id[:8]}_{filename}"
+                            local_path.write_bytes(payload.decoded_bytes)
+
                     if "text/html" in ctype.lower():
-                        extracted = ContentExtractor.extract_html_links(final_url, text)
-                        for u, d_type, _ in extracted:
-                            c_u = URLCanonicalizer.canonicalize(u)
-                            max_depth = getattr(self.cfg, "max_depth", 8)
-                            if depth < max_depth and c_u not in seen:
-                                seen.add(c_u)
-                                await q.put((c_u, depth + 1, final_url))
-                                self.enqueued += 1
+                        try:
+                            extracted = ContentExtractor.extract_html_links(final_url, text)
+                            for u, d_type, _ in extracted:
+                                c_u = URLCanonicalizer.canonicalize(u)
+                                max_depth = getattr(self.cfg, "max_depth", 8)
+                                if depth < max_depth and c_u not in seen:
+                                    seen.add(c_u)
+                                    await q.put((c_u, depth + 1, final_url))
+                                    self.enqueued += 1
+                        except Exception as parse_err:
+                            self.log.emit(f"⚠️ Content extraction warning on {final_url}: {parse_err}")
                     break
             except Exception as e:
                 if attempt >= retries:
                     self.errors += 1
                     self.log.emit(f"❌ {url}: {e}")
                 else:
-                    await asyncio.sleep(min(60, 2 ** attempt))
+                    backoff = calculate_backoff(attempt)
+                    await asyncio.sleep(backoff)
 
     async def run_async(self):
         workers = getattr(self.cfg, "workers", 32)
