@@ -27,7 +27,7 @@ class AWECConfig:
     request_timeout: int = 30
     retry_backoff_factor: float = 2.0
 
-    # Deep Anti-Blocking & Advanced Crawler Settings
+    # FANTI — advanced, configurable transport behavior.
     custom_user_agent: str = "AWEC/3.0 (+https://github.com/ARARAT33/AWEC; Archival Crawler)"
     ua_rotation_enabled: bool = True
     delay_jitter_sec: float = 0.25
@@ -37,11 +37,43 @@ class AWECConfig:
     proxy_url: str = ""
     custom_headers_json: str = "{\n  \"Accept-Language\": \"en-US,en;q=0.9\",\n  \"Cache-Control\": \"no-cache\"\n}"
 
-    # Zero / Quota Local Storage Management
-    max_local_storage_mb: int = 50  # 0 means store nothing locally (zero local footprint)
+    fanti_user_agent_profile: str = "archive"
+    fanti_header_profile: str = "Default Archive"
+    fanti_min_delay: float = 0.05
+    fanti_max_delay: float = 8.0
+    fanti_initial_delay: float = 0.15
+    fanti_adaptive_pacing: bool = True
+    fanti_min_concurrency: int = 1
+    fanti_max_concurrency: int = 32
+    fanti_initial_concurrency: int = 8
+    fanti_adaptive_concurrency: bool = True
+    fanti_max_retries: int = 5
+    fanti_backoff_strategy: str = "full_jitter"
+    fanti_base_retry_delay: float = 1.0
+    fanti_max_retry_delay: float = 60.0
+    fanti_circuit_breaker_enabled: bool = True
+    fanti_circuit_breaker_threshold: int = 5
+    fanti_circuit_breaker_cooldown: float = 30.0
+    fanti_max_connections: int = 160
+    fanti_max_connections_per_host: int = 32
+    fanti_keepalive_timeout: float = 30.0
+    fanti_dns_timeout: float = 10.0
+    fanti_connect_timeout: float = 10.0
+    fanti_read_timeout: float = 30.0
+    fanti_total_timeout: float = 60.0
+    fanti_max_redirects: int = 10
+    fanti_allow_cross_domain_redirects: bool = True
+    fanti_cookie_policy: str = "per-job"
+    fanti_bandwidth_limit_bytes_per_sec: int = 0
+    fanti_enable_browser_rendering: bool = False
+    fanti_browser_timeout: float = 30.0
+    fanti_diagnostic_mode: bool = False
+
+    # Zero / quota local storage management.
+    max_local_storage_mb: int = 50
     purge_local_files_after_upload: bool = True
 
-    # Storage & Internet Archive S3 Settings
+    # Storage & Internet Archive S3 settings.
     destination_archive: bool = True
     destination_local: bool = False
     ia_collection: str = ""
