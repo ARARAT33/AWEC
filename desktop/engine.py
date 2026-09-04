@@ -8,7 +8,6 @@ from desktop.crawler_engine import CrawlPolicy
 from desktop.crawler_engine_v12 import ResumableAWECrawler
 from awec.archive.ia import IAUploader
 
-
 class Engine(QObject):
     log = Signal(str); stats = Signal(dict); finished = Signal(str)
     def __init__(self, cfg):
@@ -19,15 +18,13 @@ class Engine(QObject):
         try:
             headers=json.loads(getattr(self.cfg,'custom_headers_json','{}') or '{}'); headers=headers if isinstance(headers,dict) else {}
         except Exception: headers={}
-        # Desktop-safe defaults: high crawler concurrency can saturate CPU while
-        # parsing/indexing/mirroring. Respect the user's value, but keep a sane cap.
         workers=min(8,max(1,int(getattr(self.cfg,'workers',8))))
         return CrawlPolicy(
             network_mode=getattr(self.cfg,'network_mode','standard'), follow_links=getattr(self.cfg,'follow_links',True),
             follow_external_domains=getattr(self.cfg,'follow_external_domains',False), include_subdomains=True, download_files=True,
             respect_robots=getattr(self.cfg,'respect_robots',True), max_depth=depth, max_file_size=getattr(self.cfg,'max_file_size',-1),
             file_types=['*'], workers=workers, rate_limit_per_host=max(0.0,getattr(self.cfg,'per_host_delay',0.15)),
-            retry_delays=[2,5,15,30], ua_rotation=getattr(self.cfg,'ua_rotation_enabled',True), delay_jitter=max(0.0,getattr(self.cfg,'delay_jitter_sec',0.25),
+            retry_delays=[2,5,15,30], ua_rotation=getattr(self.cfg,'ua_rotation_enabled',True), delay_jitter=max(0.0,getattr(self.cfg,'delay_jitter_sec',0.25)),
             auto_headers=getattr(self.cfg,'auto_headers_enabled',True), verify_ssl=getattr(self.cfg,'verify_ssl',True), proxy_url=getattr(self.cfg,'proxy_url',''),
             custom_headers=headers, max_local_mb=getattr(self.cfg,'max_local_storage_mb',0), purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),
             mirror_all_resources=True,
