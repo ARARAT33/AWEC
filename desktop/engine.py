@@ -32,24 +32,22 @@ class Engine(QObject):
     def _archive(self):
         if not getattr(self.cfg,'destination_archive',True) or not getattr(self.cfg,'ia_access_key','') or not getattr(self.cfg,'ia_secret_key','') or not getattr(self.cfg,'ia_identifier',''): return None
         raw_identifier=str(self.cfg.ia_identifier).strip()
-        # IAS3 bucket/item identifiers cannot contain spaces or arbitrary Unicode.
-        # Normalize a UI-entered item name to a valid IA identifier while keeping
-        # the configured title untouched.
         identifier=re.sub(r"[^A-Za-z0-9_.-]+","-",raw_identifier).strip("-")[:100]
         if identifier != raw_identifier:
             self.log.emit(f"ℹ️ IA identifier normalized: {raw_identifier} → {identifier}")
-        return IAUploader(self.cfg.ia_access_key,self.cfg.ia_secret_key,identifier,getattr(self.cfg,'ia_endpoint','https://s3.us.archive.org'),collection=getattr(self.cfg,'ia_collection',''),title=getattr(self.cfg,'ia_title','') or raw_identifier,creator=getattr(self.cfg,'ia_creator',''),description=getattr(self.cfg,'ia_description',''))
+        uploader=IAUploader(self.cfg.ia_access_key,self.cfg.ia_secret_key,identifier,getattr(self.cfg,'ia_endpoint','https://s3.us.archive.org'),collection=getattr(self.cfg,'ia_collection',''),title=getattr(self.cfg,'ia_title','') or raw_identifier,creator=getattr(self.cfg,'ia_creator',''),description=getattr(self.cfg,'ia_description',''))
+        # Existing items must not receive collection metadata on every PUT.
+        item_ok,_=uploader.check_item()
+        if item_ok:
+            uploader.collection=''
+        return uploader
     async def _run(self):
         seeds=list(getattr(self.cfg,'seeds',[]) or [])
         if not seeds: self.log.emit('❌ No seed URL configured'); return
         paths=ensure_layout(Path(getattr(self.cfg,'storage_root','') or app_root())); root=Path(getattr(self.cfg,'fallback_dir','') or paths['fallback']); root.mkdir(parents=True,exist_ok=True); resume_dir=getattr(self.cfg,'resume_dir','') or None; uploader=self._archive()
-        # robots.txt and sitemap.xml are optional discovery resources. They are
-        # not crawler seeds: many valid sites return 404 for one or both, and a
-        # missing optional file must never stop/retry the real crawl.
+        # robots.txt and sitemap.xml are optional discovery resources, not seeds.
+        # A site returning 404 for either must not create crawler errors/retries.
         self._crawler=ResumableAWECrawler(seeds,self._policy(),on_event=self._event,output_dir=root,resume_dir=resume_dir,ia_uploader=uploader,archive_verify=True,purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),min_free_space_mb=max(256,int(getattr(self.cfg,'min_free_space_gb',1.)*1024)),max_local_mb=max(1,int(getattr(self.cfg,'max_storage_gb',10.)*1024)),keep_local_mirror=getattr(self.cfg,'keep_local_mirror',True))
-        # The base crawler has an optional robots/sitemap bootstrap hook. AWEC
-        # handles robots policy separately, so disable that extra network work for
-        # the desktop mirror path and keep the crawl focused on actual resources.
         async def _no_bootstrap():
             return None
         self._crawler._seed_bootstrap=_no_bootstrap
