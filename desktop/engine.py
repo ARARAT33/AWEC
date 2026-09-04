@@ -19,7 +19,33 @@ class Engine(QObject):
         try:
             headers=json.loads(getattr(self.cfg,'custom_headers_json','{}') or '{}'); headers=headers if isinstance(headers,dict) else {}
         except Exception: headers={}
-        return CrawlPolicy(network_mode=getattr(self.cfg,'network_mode','standard'),follow_links=getattr(self.cfg,'follow_links',True),follow_external_domains=getattr(self.cfg,'follow_external_domains',False),include_subdomains=True,download_files=True,respect_robots=getattr(self.cfg,'respect_robots',True),max_depth=depth,max_file_size=getattr(self.cfg,'max_file_size',-1),file_types=['*'],workers=max(1,getattr(self.cfg,'workers',32)),rate_limit_per_host=max(0.0,getattr(self.cfg,'per_host_delay',0.15)),retry_delays=[2,5,15,30],ua_rotation=getattr(self.cfg,'ua_rotation_enabled',True),delay_jitter=max(0.0,getattr(self.cfg,'delay_jitter_sec',0.25)),auto_headers=getattr(self.cfg,'auto_headers_enabled',True),verify_ssl=getattr(self.cfg,'verify_ssl',True),proxy_url=getattr(self.cfg,'proxy_url',''),custom_headers=headers,max_local_mb=getattr(self.cfg,'max_local_storage_mb',0),purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),mirror_all_resources=True)
+        return CrawlPolicy(
+            network_mode=getattr(self.cfg,'network_mode','standard'), follow_links=getattr(self.cfg,'follow_links',True),
+            follow_external_domains=getattr(self.cfg,'follow_external_domains',False), include_subdomains=True, download_files=True,
+            respect_robots=getattr(self.cfg,'respect_robots',True), max_depth=depth, max_file_size=getattr(self.cfg,'max_file_size',-1),
+            file_types=['*'], workers=max(1,getattr(self.cfg,'workers',32)), rate_limit_per_host=max(0.0,getattr(self.cfg,'per_host_delay',0.15)),
+            retry_delays=[2,5,15,30], ua_rotation=getattr(self.cfg,'ua_rotation_enabled',True), delay_jitter=max(0.0,getattr(self.cfg,'delay_jitter_sec',0.25)),
+            auto_headers=getattr(self.cfg,'auto_headers_enabled',True), verify_ssl=getattr(self.cfg,'verify_ssl',True), proxy_url=getattr(self.cfg,'proxy_url',''),
+            custom_headers=headers, max_local_mb=getattr(self.cfg,'max_local_storage_mb',0), purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),
+            mirror_all_resources=True,
+            fanti_user_agent_profile=getattr(self.cfg,'fanti_user_agent_profile','archive'), fanti_custom_user_agent=getattr(self.cfg,'custom_user_agent',''),
+            fanti_header_profile=getattr(self.cfg,'fanti_header_profile','Default Archive'), fanti_min_delay=getattr(self.cfg,'fanti_min_delay',0.05),
+            fanti_max_delay=getattr(self.cfg,'fanti_max_delay',8.0), fanti_initial_delay=getattr(self.cfg,'fanti_initial_delay',0.15),
+            fanti_adaptive_pacing=getattr(self.cfg,'fanti_adaptive_pacing',True), fanti_min_concurrency=getattr(self.cfg,'fanti_min_concurrency',1),
+            fanti_max_concurrency=getattr(self.cfg,'fanti_max_concurrency',32), fanti_initial_concurrency=getattr(self.cfg,'fanti_initial_concurrency',8),
+            fanti_adaptive_concurrency=getattr(self.cfg,'fanti_adaptive_concurrency',True), fanti_max_retries=getattr(self.cfg,'fanti_max_retries',5),
+            fanti_backoff_strategy=getattr(self.cfg,'fanti_backoff_strategy','full_jitter'), fanti_base_retry_delay=getattr(self.cfg,'fanti_base_retry_delay',1.0),
+            fanti_max_retry_delay=getattr(self.cfg,'fanti_max_retry_delay',60.0), fanti_circuit_breaker_enabled=getattr(self.cfg,'fanti_circuit_breaker_enabled',True),
+            fanti_circuit_breaker_threshold=getattr(self.cfg,'fanti_circuit_breaker_threshold',5), fanti_circuit_breaker_cooldown=getattr(self.cfg,'fanti_circuit_breaker_cooldown',30.0),
+            fanti_max_connections=getattr(self.cfg,'fanti_max_connections',160), fanti_max_connections_per_host=getattr(self.cfg,'fanti_max_connections_per_host',32),
+            fanti_keepalive_timeout=getattr(self.cfg,'fanti_keepalive_timeout',30.0), fanti_dns_timeout=getattr(self.cfg,'fanti_dns_timeout',10.0),
+            fanti_connect_timeout=getattr(self.cfg,'fanti_connect_timeout',10.0), fanti_read_timeout=getattr(self.cfg,'fanti_read_timeout',30.0),
+            fanti_total_timeout=getattr(self.cfg,'fanti_total_timeout',60.0), fanti_max_redirects=getattr(self.cfg,'fanti_max_redirects',10),
+            fanti_allow_cross_domain_redirects=getattr(self.cfg,'fanti_allow_cross_domain_redirects',True), fanti_cookie_policy=getattr(self.cfg,'fanti_cookie_policy','per-job'),
+            fanti_bandwidth_limit_bytes_per_sec=getattr(self.cfg,'fanti_bandwidth_limit_bytes_per_sec',0),
+            fanti_enable_browser_rendering=getattr(self.cfg,'fanti_enable_browser_rendering',False), fanti_browser_timeout=getattr(self.cfg,'fanti_browser_timeout',30.0),
+            fanti_diagnostic_mode=getattr(self.cfg,'fanti_diagnostic_mode',False),
+        )
 
     def _event(self,name,payload):
         if name=='crawl_started': self.log.emit('🚀 AWEC v12 • full reachable resource graph')
@@ -39,8 +65,6 @@ class Engine(QObject):
     async def _run(self):
         seeds=list(getattr(self.cfg,'seeds',[]) or [])
         if not seeds: self.log.emit('❌ No seed URL configured'); return
-        # Bootstrap common site indexes. They are crawled as ordinary resources and
-        # can expand the frontier even when navigation links are sparse.
         bootstrap=list(seeds)
         for seed in seeds:
             p=urlparse(seed); origin=f"{p.scheme}://{p.netloc}"
