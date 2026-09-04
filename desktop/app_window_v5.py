@@ -42,7 +42,7 @@ class AWECMainWindow(QMainWindow):
             c=W(QFrame,name="metricCard"); q=QVBoxLayout(c); q.addWidget(W(QLabel,t.upper(),name="metricTitle")); v=W(QLabel,"0",name="metricValue"); q.addWidget(v); self.metrics[k]=v; grid.addWidget(c,i//4,i%4)
         l.addLayout(grid); box=QGroupBox("Quick Start"); f=QFormLayout(box); self.quick=QLineEdit(); self.quick.setPlaceholderText("https://example.com"); self.quick.returnPressed.connect(self.start_crawl); f.addRow("Seed URL",self.quick); self.domain=QLabel("—"); f.addRow("Active domain",self.domain); l.addWidget(box)
         row=QHBoxLayout(); self.start_btn=W(QPushButton,"▶  Start Crawl",name="primaryButton"); self.start_btn.clicked.connect(self.start_crawl); self.pause_btn=W(QPushButton,"⏸  Pause",name="warningButton"); self.pause_btn.clicked.connect(self.pause_crawl); self.stop_btn=W(QPushButton,"■  Stop",name="dangerButton"); self.stop_btn.clicked.connect(self.stop_crawl); row.addWidget(self.start_btn); row.addWidget(self.pause_btn); row.addWidget(self.stop_btn); l.addLayout(row)
-        self.dashboard_log=QPlainTextEdit(); self.dashboard_log.setReadOnly(True); self.dashboard_log.setPlaceholderText("Engine messages appear here…"); l.addWidget(self.dashboard_log,1); self.pages.addWidget(p)
+        self.dashboard_log=QPlainTextEdit(); self.dashboard_log.setReadOnly(True); self.dashboard_log.setMaximumBlockCount(300); self.dashboard_log.setPlaceholderText("Engine messages appear here…"); l.addWidget(self.dashboard_log,1); self.pages.addWidget(p)
 
     def _sites(self):
         p,l=self._shell("Seed Sites","Add the URLs AWEC should crawl."); self.site_list=QListWidget(); l.addWidget(self.site_list,1)
@@ -61,11 +61,10 @@ class AWECMainWindow(QMainWindow):
         l.addWidget(box); self.ia_status=W(QLabel,"● Not checked",name="infoBadge"); l.addWidget(self.ia_status); row=QHBoxLayout(); ck=QPushButton("✓ Check Collection / Item"); ck.clicked.connect(self.check_ia); sv=W(QPushButton,"Save Settings",name="primaryButton"); sv.clicked.connect(self.save_config); row.addWidget(ck); row.addWidget(sv); row.addStretch(); l.addLayout(row); h=W(QLabel,"Flow: Collection check → Item check → missing item is created by first upload → crawl continues.",name="hint"); h.setWordWrap(True); l.addWidget(h); l.addStretch(); self.pages.addWidget(p)
 
     def _logs(self):
-        p,l=self._shell("Live Logs","Engine output, IA status and errors."); self.logs=QPlainTextEdit(); self.logs.setReadOnly(True); l.addWidget(self.logs,1); b=QPushButton("Clear Logs"); b.clicked.connect(self.logs.clear); l.addWidget(b,0,Qt.AlignmentFlag.AlignRight); self.pages.addWidget(p)
+        p,l=self._shell("Live Logs","Engine output, IA status and errors."); self.logs=QPlainTextEdit(); self.logs.setReadOnly(True); self.logs.document().setMaximumBlockCount(1500); l.addWidget(self.logs,1); b=QPushButton("Clear Logs"); b.clicked.connect(self.logs.clear); l.addWidget(b,0,Qt.AlignmentFlag.AlignRight); self.pages.addWidget(p)
 
     def _page(self,k):
         self.pages.setCurrentIndex({"dashboard":0,"sites":1,"crawler":2,"ia":3,"logs":4}[k]); [b.setChecked(x==k) for x,b in self.nav.items()]
-
     def add_site(self):
         u=self.site_input.text().strip()
         if not u:return
@@ -75,25 +74,21 @@ class AWECMainWindow(QMainWindow):
     def remove_site(self):
         r=self.site_list.currentRow()
         if r>=0:self.site_list.takeItem(r)
-
     def _cfg(self):
         seeds=[self.site_list.item(i).text() for i in range(self.site_list.count())]
         if self.quick.text().strip():
             u=self.quick.text().strip();u=u if u.startswith(("http://","https://")) else "https://"+u
             if u not in seeds:seeds.append(u)
         return AWECConfig(seeds=seeds,network_mode=self.net_mode.currentData(),workers=self.workers.value(),max_depth=self.depth.value(),max_urls=self.max_urls.value(),per_host_delay=self.delay.value(),request_timeout=self.timeout.value(),max_retries=self.retries.value(),same_domain_only=self.same_domain.isChecked(),respect_robots=self.robots.isChecked(),custom_user_agent=self.ua.text(),ua_rotation_enabled=self.ua_rotate.isChecked(),delay_jitter_sec=self.jitter.value(),cookie_jar_enabled=self.cookies.isChecked(),verify_ssl=self.ssl.isChecked(),proxy_url=self.proxy.text(),ia_collection=self.ia_collection.text().strip(),ia_identifier=self.ia_item.text().strip(),ia_title=self.ia_title.text().strip(),ia_creator=self.ia_creator.text().strip(),ia_description=self.ia_desc.toPlainText().strip(),ia_access_key=self.ia_access.text(),ia_secret_key=self.ia_secret.text(),ia_endpoint=self.ia_endpoint.text().strip() or "https://s3.us.archive.org")
-
     def _load_config(self):
         try:self.config=AWECConfig.load(Path.home()/"AWEC"/"config.json")
         except Exception:self.config=AWECConfig()
         c=self.config
         for u in c.seeds:self.site_list.addItem(u)
-        self.workers.setValue(c.workers);self.depth.setValue(c.max_depth);self.max_urls.setValue(c.max_urls);self.delay.setValue(c.per_host_delay);self.timeout.setValue(c.request_timeout);self.retries.setValue(c.max_retries);self.same_domain.setChecked(c.same_domain_only);self.robots.setChecked(c.respect_robots);self.net_mode.setCurrentIndex(1 if c.network_mode=="fanti" else 0);self.ua.setText(c.custom_user_agent);self.ua_rotate.setChecked(c.ua_rotation_enabled);self.jitter.setValue(c.delay_jitter_sec);self.cookies.setChecked(c.cookie_jar_enabled);self.ssl.setChecked(c.verify_ssl);self.proxy.setText(c.proxy_url);self.ia_collection.setText(c.ia_collection);self.ia_item.setText(c.ia_identifier);self.ia_title.setText(c.ia_title);self.ia_creator.setText(c.ia_creator);self.ia_desc.setPlainText(c.ia_description);self.ia_access.setText(c.ia_access_key);self.ia_secret.setText(c.ia_secret_key);self.ia_endpoint.setText(c.ia_endpoint)
-
+        self.workers.setValue(min(8,max(1,c.workers)));self.depth.setValue(c.max_depth);self.max_urls.setValue(c.max_urls);self.delay.setValue(c.per_host_delay);self.timeout.setValue(c.request_timeout);self.retries.setValue(c.max_retries);self.same_domain.setChecked(c.same_domain_only);self.robots.setChecked(c.respect_robots);self.net_mode.setCurrentIndex(1 if c.network_mode=="fanti" else 0);self.ua.setText(c.custom_user_agent);self.ua_rotate.setChecked(c.ua_rotation_enabled);self.jitter.setValue(c.delay_jitter_sec);self.cookies.setChecked(c.cookie_jar_enabled);self.ssl.setChecked(c.verify_ssl);self.proxy.setText(c.proxy_url);self.ia_collection.setText(c.ia_collection);self.ia_item.setText(c.ia_identifier);self.ia_title.setText(c.ia_title);self.ia_creator.setText(c.ia_creator);self.ia_desc.setPlainText(c.ia_description);self.ia_access.setText(c.ia_access_key);self.ia_secret.setText(c.ia_secret_key);self.ia_endpoint.setText(c.ia_endpoint)
     def save_config(self):
         try:self.config=self._cfg();self.config.save(Path.home()/"AWEC"/"config.json");self.ia_status.setText("✓ Settings saved locally");self._log("💾 Configuration saved")
         except Exception as e:QMessageBox.critical(self,"AWEC",str(e))
-
     def check_ia(self):
         c=self.ia_collection.text().strip();i=self.ia_item.text().strip()
         if not c or not i:self.ia_status.setText("⚠ Collection Name and Item Name are required");return
@@ -101,7 +96,6 @@ class AWECMainWindow(QMainWindow):
         try:
             u=IAUploader(self.ia_access.text(),self.ia_secret.text(),i,self.ia_endpoint.text().strip() or "https://s3.us.archive.org",collection=c,title=self.ia_title.text(),creator=self.ia_creator.text(),description=self.ia_desc.toPlainText());ok,msg=u.validate_destination();self.ia_status.setText(("✓ " if ok else "✗ ")+msg);self._log(("✓ " if ok else "✗ ")+msg)
         except Exception as e:self.ia_status.setText("✗ IA CHECK FAILED: "+str(e));self._log("❌ IA check failed: "+str(e))
-
     def start_crawl(self):
         if self.running:
             if self.engine and self.engine.is_paused:self.engine.is_paused=False;self.status.setText("● RUNNING");self._log("▶ Crawl resumed")
@@ -123,7 +117,8 @@ class AWECMainWindow(QMainWindow):
             if k in self.metrics:self.metrics[k].setText(f"{v:,}" if isinstance(v,(int,float)) else str(v))
         if "active_domain" in s:self.domain.setText(str(s["active_domain"]))
     @Slot(str)
-    def _log(self,msg):self.logs.appendPlainText(msg);self.dashboard_log.appendPlainText(msg)
+    def _log(self,msg):
+        self.logs.appendPlainText(msg);self.dashboard_log.appendPlainText(msg)
     @Slot(str)
     def _finished(self,msg):
         self.running=False;self.start_btn.setEnabled(True);self.status.setText("● READY");self._log("🏁 Crawl finished: "+msg)
