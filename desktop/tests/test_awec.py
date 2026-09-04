@@ -67,6 +67,13 @@ class TestAWECDeep(unittest.TestCase):
 
         win.close()
 
+    def test_dashboard_quick_seed_scan(self):
+        win = AWECMainWindow()
+        win.dash_seed_input.setText("https://example.org")
+        cfg = win.build_config_from_ui()
+        self.assertIn("https://example.org", cfg.seeds)
+        win.close()
+
     def test_storage_sink_zero_quota(self):
         sink = LocalSink("fallback_test", max_storage_mb=0)
         res = sink.put("test.com", "https://test.com/img.png", b"1234")
