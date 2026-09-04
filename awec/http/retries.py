@@ -51,8 +51,8 @@ class CircuitBreaker:
 
 class RateLimiter:
     def __init__(self, rate_per_sec: float = 2.0, concurrency_limit: int = 4):
-        self.rate_per_sec = rate_per_sec
-        self.concurrency_limit = concurrency_limit
+        self.rate_per_sec = max(0.1, float(rate_per_sec))
+        self.concurrency_limit = max(1, int(concurrency_limit))
         self.next_time: Dict[str, float] = {}
         self.circuit_breakers: Dict[str, CircuitBreaker] = {}
         self.active_requests: Dict[str, int] = {}
@@ -64,21 +64,29 @@ class RateLimiter:
         return self.circuit_breakers[domain]
 
     async def acquire(self, domain: str) -> bool:
-        async with self.lock:
-            cb = self.get_circuit_breaker(domain)
-            if not cb.can_execute():
-                return False
+        """Acquire a host slot without dropping requests when the host is busy.
 
-            active = self.active_requests.get(domain, 0)
-            if active >= self.concurrency_limit:
-                return False
+        The old implementation returned False when all per-host slots were in
+        use. With a crawler batch this converted normal contention into HTTP 429
+        failures and repeatedly requeued URLs. Waiting briefly is the correct
+        behavior: rate limiting should pace work, not discard queued work.
+        """
+        while True:
+            async with self.lock:
+                cb = self.get_circuit_breaker(domain)
+                if not cb.can_execute():
+                    return False
 
-            now = time.time()
-            nxt = self.next_time.get(domain, 0.0)
-            delay = max(0.0, nxt - now)
+                active = self.active_requests.get(domain, 0)
+                if active < self.concurrency_limit:
+                    now = time.time()
+                    nxt = self.next_time.get(domain, 0.0)
+                    delay = max(0.0, nxt - now)
+                    self.next_time[domain] = max(now, nxt) + (1.0 / self.rate_per_sec)
+                    self.active_requests[domain] = active + 1
+                    break
 
-            self.next_time[domain] = max(now, nxt) + (1.0 / max(0.1, self.rate_per_sec))
-            self.active_requests[domain] = active + 1
+            await asyncio.sleep(0.01)
 
         if delay > 0:
             await asyncio.sleep(delay)
