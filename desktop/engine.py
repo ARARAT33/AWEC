@@ -19,11 +19,15 @@ class Engine(QObject):
             headers=json.loads(getattr(self.cfg,'custom_headers_json','{}') or '{}'); headers=headers if isinstance(headers,dict) else {}
         except Exception: headers={}
         workers=min(8,max(1,int(getattr(self.cfg,'workers',8))))
+        # The desktop setting is a delay in seconds between requests to one host.
+        # RateLimiter expects requests/second, so convert units explicitly.
+        per_host_delay=max(0.0,float(getattr(self.cfg,'per_host_delay',0.15)))
+        host_rate=(1.0/per_host_delay) if per_host_delay > 0 else 1000.0
         return CrawlPolicy(
             network_mode=getattr(self.cfg,'network_mode','standard'), follow_links=getattr(self.cfg,'follow_links',True),
             follow_external_domains=getattr(self.cfg,'follow_external_domains',False), include_subdomains=True, download_files=True,
             respect_robots=getattr(self.cfg,'respect_robots',True), max_depth=depth, max_file_size=getattr(self.cfg,'max_file_size',-1),
-            file_types=['*'], workers=workers, rate_limit_per_host=max(0.0,getattr(self.cfg,'per_host_delay',0.15)),
+            file_types=['*'], workers=workers, rate_limit_per_host=host_rate,
             retry_delays=[2,5,15,30], ua_rotation=getattr(self.cfg,'ua_rotation_enabled',True), delay_jitter=max(0.0,getattr(self.cfg,'delay_jitter_sec',0.25)),
             auto_headers=getattr(self.cfg,'auto_headers_enabled',True), verify_ssl=getattr(self.cfg,'verify_ssl',True), proxy_url=getattr(self.cfg,'proxy_url',''),
             custom_headers=headers, max_local_mb=getattr(self.cfg,'max_local_storage_mb',0), purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),
@@ -52,6 +56,7 @@ class Engine(QObject):
         elif name=='crawl_resumed': self.log.emit(f"♻️ RESUME • {payload.get('crawl_id')} restored")
         elif name=='discovery': self.log.emit(f"🔎 DISCOVERY • +{payload.get('found',0)} found • queued={payload.get('queued',0):,} • rejected={payload.get('rejected',0):,}")
         elif name=='page_fetched': self.log.emit(f"⬇️ [{payload.get('status')}] {payload.get('url')} → {payload.get('local_path')} ({payload.get('size',0):,} bytes)")
+        elif name=='request_failed': self.log.emit(f"⚠️ FETCH FAILED • [{payload.get('status')}] {payload.get('url')}")
         elif name=='archive_uploaded': self.log.emit(f"☁️ IA VERIFIED • {payload.get('remote_key')}")
         elif name=='archive_upload_failed': self.log.emit(f"⚠️ IA upload failed • {payload.get('url')}: {payload.get('message')}")
         elif name=='storage_guard': self.log.emit(f"🛡️ STORAGE GUARD • {payload.get('message')}")
