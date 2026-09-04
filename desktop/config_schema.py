@@ -7,7 +7,7 @@ FILE_TYPES = ['*']
 
 @dataclass
 class AWECConfig:
-    network_mode: str = "standard"  # standard or fanti
+    network_mode: str = "standard"
     seeds: list[str] = field(default_factory=list)
     follow_links: bool = True
     follow_subdomains: bool = True
@@ -27,7 +27,6 @@ class AWECConfig:
     request_timeout: int = 30
     retry_backoff_factor: float = 2.0
 
-    # FANTI — advanced, configurable transport behavior.
     custom_user_agent: str = "AWEC/3.0 (+https://github.com/ARARAT33/AWEC; Archival Crawler)"
     ua_rotation_enabled: bool = True
     delay_jitter_sec: float = 0.25
@@ -69,13 +68,19 @@ class AWECConfig:
     fanti_browser_timeout: float = 30.0
     fanti_diagnostic_mode: bool = False
 
-    # Zero / quota local storage management.
-    max_local_storage_mb: int = 50
-    purge_local_files_after_upload: bool = True
+    # Portable storage: only config/IA are persistent-protected; crawl data is quota-bound.
+    storage_root: str = ""
+    max_storage_gb: float = 10.0
+    min_free_space_gb: float = 1.0
+    max_local_storage_mb: int = 0
+    purge_local_files_after_upload: bool = False
+    keep_local_mirror: bool = True
+    purge_local_files_after_upload: bool = False
+    tmpcrawl_dir: str = ""
+    resume_dir: str = ""
 
-    # Storage & Internet Archive S3 settings.
     destination_archive: bool = True
-    destination_local: bool = False
+    destination_local: bool = True
     ia_collection: str = ""
     ia_identifier: str = ""
     ia_creator: str = ""
@@ -85,11 +90,14 @@ class AWECConfig:
     ia_access_key: str = ""
     ia_secret_key: str = ""
     ia_endpoint: str = "https://s3.us.archive.org"
-    fallback_dir: str = "fallback"
-
-    checkpoint_path: str = "awec-state/checkpoint.json"
+    fallback_dir: str = ""
+    checkpoint_path: str = ""
     language: str = "en"
     custom_language_file: str = ""
+
+    # First-run safety acknowledgement is intentionally persistent in config.
+    safety_configured: bool = False
+    safety_version: int = 1
 
     def to_dict(self):
         return asdict(self)
