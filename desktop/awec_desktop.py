@@ -3,7 +3,8 @@
 import sys
 from PySide6.QtWidgets import QApplication
 from desktop.theme import apply_theme
-from desktop.app_window_v6 import AWECMainWindow
+from desktop.app_window_v7 import AWECMainWindow
+
 
 def main():
     app = QApplication.instance() or QApplication(sys.argv)
@@ -12,6 +13,7 @@ def main():
     window = AWECMainWindow()
     window.show()
     return app.exec()
+
 
 if __name__ == "__main__":
     sys.exit(main())
