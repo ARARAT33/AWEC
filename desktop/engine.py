@@ -319,6 +319,8 @@ class Engine(QObject):
                     await q.put((u, 0, "seed"))
                     self.enqueued += 1
 
+        self.emit(current_domain=list(seed_hosts)[0] if seed_hosts else "—", q_size=q.qsize())
+
         if q.empty():
             self.log.emit("⚠️ No valid seeds found.")
             return

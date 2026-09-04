@@ -151,6 +151,11 @@ class AWECMainWindow(QMainWindow):
         self.status_box_ref = status_box
         slayout = QFormLayout(status_box)
 
+        self.dash_seed_input = QLineEdit()
+        self.dash_seed_input.setPlaceholderText("Enter seed URL to scan e.g. https://example.com")
+        self.dash_seed_input.returnPressed.connect(self.start_crawl)
+        slayout.addRow("Quick Seed URL:", self.dash_seed_input)
+
         self.domain_val_lbl = QLabel("—")
         self.domain_val_lbl.setStyleSheet("font-weight: bold; color: #3b71fe;")
         slayout.addRow("Active Domain:", self.domain_val_lbl)
@@ -719,6 +724,13 @@ class AWECMainWindow(QMainWindow):
 
     def build_config_from_ui(self) -> AWECConfig:
         seeds = [self.site_list_widget.item(i).text() for i in range(self.site_list_widget.count())]
+        dash_seed = self.dash_seed_input.text().strip()
+        if dash_seed:
+            if not dash_seed.startswith(("http://", "https://")):
+                dash_seed = "https://" + dash_seed
+            if dash_seed not in seeds:
+                seeds.append(dash_seed)
+
         exts = [x.strip() for x in self.input_ext.toPlainText().replace(",", " ").split() if x.strip()]
 
         try:
@@ -764,16 +776,25 @@ class AWECMainWindow(QMainWindow):
 
     # ── Crawler Execution ───────────────────────────────────────
     def start_crawl(self):
+        dash_url = self.dash_seed_input.text().strip()
+        site_url = self.site_input.text().strip()
+
+        if dash_url:
+            if not dash_url.startswith(("http://", "https://")):
+                dash_url = "https://" + dash_url
+            if not any(self.site_list_widget.item(i).text() == dash_url for i in range(self.site_list_widget.count())):
+                self.site_list_widget.addItem(dash_url)
+
+        if site_url:
+            if not site_url.startswith(("http://", "https://")):
+                site_url = "https://" + site_url
+            if not any(self.site_list_widget.item(i).text() == site_url for i in range(self.site_list_widget.count())):
+                self.site_list_widget.addItem(site_url)
+            self.site_input.clear()
+
         if self.site_list_widget.count() == 0:
-            url = self.site_input.text().strip()
-            if url:
-                if not url.startswith(("http://", "https://")):
-                    url = "https://" + url
-                self.site_list_widget.addItem(url)
-                self.site_input.clear()
-            else:
-                QMessageBox.warning(self, "AWEC", "Please add at least one seed site before starting.")
-                return
+            QMessageBox.warning(self, "AWEC", "Please enter at least one seed site URL before starting.")
+            return
 
         if self.engine and self.engine.stop_event and not self.engine.stop_event.is_set():
             if getattr(self.engine, 'is_paused', False):
