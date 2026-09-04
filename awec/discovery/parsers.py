@@ -56,6 +56,14 @@ class ContentExtractor:
                 results.append((u, "stylesheet", "text/css"))
             elif "icon" in rel:
                 results.append((u, "icon", "image/*"))
+            elif "canonical" in rel:
+                results.append((u, "canonical", "text/html"))
+            elif "alternate" in rel:
+                type_attr = link.get("type", "").lower()
+                if "rss" in type_attr or "atom" in type_attr or "json" in type_attr:
+                    results.append((u, "feed", type_attr))
+                else:
+                    results.append((u, "alternate", ""))
             else:
                 results.append((u, "html_link", ""))
 
@@ -86,6 +94,36 @@ class ContentExtractor:
         return results
 
     @staticmethod
+    def parse_feed(feed_content: str, base_url: str) -> List[Tuple[str, str, str]]:
+        """Parses RSS, Atom, or JSON Feed and returns (url, discovery_type, title)"""
+        results: List[Tuple[str, str, str]] = []
+        try:
+            root = ET.fromstring(feed_content)
+            # RSS
+            for item in root.findall(".//item"):
+                link_elem = item.find("link")
+                title_elem = item.find("title")
+                if link_elem is not None and link_elem.text:
+                    u = urljoin(base_url, link_elem.text.strip())
+                    t = title_elem.text.strip() if title_elem is not None and title_elem.text else ""
+                    results.append((u, "feed_entry", t))
+
+            # Atom
+            ns = ""
+            if root.tag.startswith("{"):
+                ns = root.tag.split("}")[0] + "}"
+            for entry in root.findall(f".//{ns}entry"):
+                title_elem = entry.find(f"{ns}title")
+                t = title_elem.text.strip() if title_elem is not None and title_elem.text else ""
+                for link in entry.findall(f"{ns}link"):
+                    href = link.get("href")
+                    if href:
+                        results.append((urljoin(base_url, href.strip()), "feed_entry", t))
+        except Exception:
+            pass
+        return results
+
+    @staticmethod
     def parse_sitemap(sitemap_bytes: bytes, is_gzipped: bool = False) -> List[str]:
         urls: List[str] = []
         try:
@@ -103,3 +141,26 @@ class ContentExtractor:
         except Exception:
             pass
         return urls
+
+
+class BrowserRenderer:
+    """Optional isolated browser rendering engine (disabled by default)."""
+
+    def __init__(self, timeout_sec: float = 30.0, max_tabs: int = 2):
+        self.timeout_sec = timeout_sec
+        self.max_tabs = max_tabs
+
+    async def render_page(self, url: str) -> Tuple[str, List[Tuple[str, str, str]]]:
+        """Renders page using Playwright if available, otherwise returns empty."""
+        try:
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
+                await page.goto(url, timeout=int(self.timeout_sec * 1000))
+                content = await page.content()
+                await browser.close()
+                links = ContentExtractor.extract_html_links(url, content)
+                return content, links
+        except Exception:
+            return "", []

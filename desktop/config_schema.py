@@ -7,6 +7,7 @@ FILE_TYPES = ['*']
 
 @dataclass
 class AWECConfig:
+    network_mode: str = "standard"  # standard or fanti
     seeds: list[str] = field(default_factory=list)
     follow_links: bool = True
     follow_subdomains: bool = True

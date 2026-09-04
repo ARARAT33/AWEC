@@ -96,3 +96,38 @@ class IAUploader:
             return resp.get("ContentLength") == expected_size
         except Exception:
             return False
+
+
+class SpoolPublisher:
+    """Manages upload spooling and background retry worker for IA / S3 publishing."""
+
+    def __init__(self, uploader: IAUploader, store: Any):
+        self.uploader = uploader
+        self.store = store
+
+    def process_pending_uploads(self) -> Dict[str, int]:
+        pending = self.store.get_pending_uploads()
+        stats = {"success": 0, "failed": 0, "skipped": 0}
+
+        for item in pending:
+            local_path = Path(item["local_path"])
+            if not local_path.exists():
+                self.store.update_upload_spool_status(item["id"], "failed", "Local spool file missing")
+                stats["failed"] += 1
+                continue
+
+            self.store.update_upload_spool_status(item["id"], "uploading")
+            ok, msg = self.uploader.upload_file_s3(local_path, item["remote_key"])
+            if ok:
+                verified = self.uploader.verify_remote_object(item["remote_key"], local_path.stat().st_size)
+                if verified:
+                    self.store.update_upload_spool_status(item["id"], "verified")
+                    stats["success"] += 1
+                else:
+                    self.store.update_upload_spool_status(item["id"], "failed", "Verification size mismatch")
+                    stats["failed"] += 1
+            else:
+                self.store.update_upload_spool_status(item["id"], "failed", msg)
+                stats["failed"] += 1
+
+        return stats
