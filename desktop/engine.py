@@ -1,4 +1,4 @@
-"""AWEC desktop engine bridge with conservative desktop resource usage."""
+"""AWEC desktop engine bridge with portable storage and conservative resource usage."""
 from __future__ import annotations
 import asyncio, json, threading
 from pathlib import Path
@@ -7,6 +7,7 @@ from PySide6.QtCore import QObject, Signal
 from desktop.crawler_engine import CrawlPolicy
 from desktop.crawler_engine_v12 import ResumableAWECrawler
 from awec.archive.ia import IAUploader
+from storage_layout import ensure_layout, app_root
 
 class Engine(QObject):
     log = Signal(str); stats = Signal(dict); finished = Signal(str)
@@ -19,8 +20,6 @@ class Engine(QObject):
             headers=json.loads(getattr(self.cfg,'custom_headers_json','{}') or '{}'); headers=headers if isinstance(headers,dict) else {}
         except Exception: headers={}
         workers=min(8,max(1,int(getattr(self.cfg,'workers',8))))
-        # The desktop setting is a delay in seconds between requests to one host.
-        # RateLimiter expects requests/second, so convert units explicitly.
         per_host_delay=max(0.0,float(getattr(self.cfg,'per_host_delay',0.15)))
         host_rate=(1.0/per_host_delay) if per_host_delay > 0 else 1000.0
         return CrawlPolicy(
@@ -30,7 +29,7 @@ class Engine(QObject):
             file_types=['*'], workers=workers, rate_limit_per_host=host_rate,
             retry_delays=[2,5,15,30], ua_rotation=getattr(self.cfg,'ua_rotation_enabled',True), delay_jitter=max(0.0,getattr(self.cfg,'delay_jitter_sec',0.25)),
             auto_headers=getattr(self.cfg,'auto_headers_enabled',True), verify_ssl=getattr(self.cfg,'verify_ssl',True), proxy_url=getattr(self.cfg,'proxy_url',''),
-            custom_headers=headers, max_local_mb=getattr(self.cfg,'max_local_storage_mb',0), purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),
+            custom_headers=headers, max_local_mb=0, purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),
             mirror_all_resources=True,
             fanti_user_agent_profile=getattr(self.cfg,'fanti_user_agent_profile','archive'), fanti_custom_user_agent=getattr(self.cfg,'custom_user_agent',''),
             fanti_header_profile=getattr(self.cfg,'fanti_header_profile','Default Archive'), fanti_min_delay=getattr(self.cfg,'fanti_min_delay',0.05),
@@ -64,23 +63,32 @@ class Engine(QObject):
         elif name=='crawler_error': self.log.emit(f"💥 {payload.get('message')}")
 
     def _archive(self):
-        if not getattr(self.cfg,'archive_upload_live',True) or not getattr(self.cfg,'ia_access_key','') or not getattr(self.cfg,'ia_secret_key','') or not getattr(self.cfg,'ia_identifier',''): return None
+        if not getattr(self.cfg,'destination_archive',True) or not getattr(self.cfg,'ia_access_key','') or not getattr(self.cfg,'ia_secret_key','') or not getattr(self.cfg,'ia_identifier',''): return None
         return IAUploader(self.cfg.ia_access_key,self.cfg.ia_secret_key,self.cfg.ia_identifier,getattr(self.cfg,'ia_endpoint','https://s3.us.archive.org'),collection=getattr(self.cfg,'ia_collection',''),title=getattr(self.cfg,'ia_title',''),creator=getattr(self.cfg,'ia_creator',''),description=getattr(self.cfg,'ia_description',''))
 
     async def _run(self):
         seeds=list(getattr(self.cfg,'seeds',[]) or [])
         if not seeds: self.log.emit('❌ No seed URL configured'); return
+        paths=ensure_layout(Path(getattr(self.cfg,'storage_root','') or app_root()))
+        root=Path(getattr(self.cfg,'fallback_dir','') or paths['fallback'])
+        root.mkdir(parents=True,exist_ok=True)
+        resume_dir=getattr(self.cfg,'resume_dir','') or None
+        uploader=self._archive()
         bootstrap=list(seeds)
         for seed in seeds:
             p=urlparse(seed); origin=f"{p.scheme}://{p.netloc}"
             for u in (origin+'/robots.txt',origin+'/sitemap.xml'):
                 if u not in bootstrap: bootstrap.append(u)
-        root=Path(getattr(self.cfg,'tmpcrawl_dir','') or getattr(self.cfg,'fallback_dir','') or Path.home()/'AWEC'/'tmpcrawl'); root.mkdir(parents=True,exist_ok=True)
-        uploader=self._archive(); resume_dir=getattr(self.cfg,'resume_dir','') or None
-        self._crawler=ResumableAWECrawler(bootstrap,self._policy(),on_event=self._event,output_dir=root,resume_dir=resume_dir,ia_uploader=uploader,archive_verify=getattr(self.cfg,'archive_verify_uploads',True),purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),min_free_space_mb=getattr(self.cfg,'min_free_space_mb',2048),max_local_mb=getattr(self.cfg,'max_local_storage_mb',0),keep_local_mirror=getattr(self.cfg,'keep_local_mirror',True))
+        self._crawler=ResumableAWECrawler(
+            bootstrap,self._policy(),on_event=self._event,output_dir=root,resume_dir=resume_dir,
+            ia_uploader=uploader,archive_verify=True,purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),
+            min_free_space_mb=max(256,int(getattr(self.cfg,'min_free_space_gb',1.0)*1024)),
+            max_local_mb=max(1,int(getattr(self.cfg,'max_storage_gb',10.0)*1024)),
+            keep_local_mirror=getattr(self.cfg,'keep_local_mirror',True))
         self.log.emit(f'🌐 Seeds: {", ".join(seeds)}')
         self.log.emit(f'🕸️ Concurrency: {self._policy().workers} workers')
-        self.log.emit(f'📦 tmpcrawl: {root} • limit={getattr(self.cfg,"max_local_storage_mb",0) or "UNLIMITED"} MB • reserve={getattr(self.cfg,"min_free_space_mb",2048)} MB')
+        self.log.emit(f'📦 AWEC storage: {paths["root"]} • quota={getattr(self.cfg,"max_storage_gb",10):g} GB • reserve={getattr(self.cfg,"min_free_space_gb",1):g} GB')
+        self.log.emit(f'🗂️ Data: {root} • persistent: {paths["config"]}, {paths["ia"]}')
         if uploader:self.log.emit('☁️ Internet Archive LIVE upload + verification enabled')
         await self._crawler.run(); s=self._crawler.stats
         self.stats.emit({'queued':s.get('queued',0),'enqueued':s.get('enqueued',0),'fetched':s.get('pages',0)+s.get('files',0),'pages':s.get('pages',0),'found':s.get('files',0),'files':s.get('files',0),'downloaded':s.get('mirrored',0),'uploaded':s.get('uploaded',0),'mirrored':s.get('mirrored',0),'mirror_bytes':s.get('mirror_bytes',0),'errors':s.get('errors',0),'active':0,'speed':s.get('status','Completed'),'active_domain':s.get('active_domain',seeds[0])})
