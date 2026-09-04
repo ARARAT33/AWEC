@@ -26,7 +26,6 @@ class AWECConfig:
     max_retries: int = 3
     request_timeout: int = 30
     retry_backoff_factor: float = 2.0
-
     custom_user_agent: str = "AWEC/3.0 (+https://github.com/ARARAT33/AWEC; Archival Crawler)"
     ua_rotation_enabled: bool = True
     delay_jitter_sec: float = 0.25
@@ -35,7 +34,6 @@ class AWECConfig:
     auto_headers_enabled: bool = True
     proxy_url: str = ""
     custom_headers_json: str = "{\n  \"Accept-Language\": \"en-US,en;q=0.9\",\n  \"Cache-Control\": \"no-cache\"\n}"
-
     fanti_user_agent_profile: str = "archive"
     fanti_header_profile: str = "Default Archive"
     fanti_min_delay: float = 0.05
@@ -68,14 +66,13 @@ class AWECConfig:
     fanti_browser_timeout: float = 30.0
     fanti_diagnostic_mode: bool = False
 
-    # Portable storage: only config/IA are persistent-protected; crawl data is quota-bound.
+    # Portable storage. config/ and ia/ are persistent; crawl data is quota-bound.
     storage_root: str = ""
     max_storage_gb: float = 10.0
     min_free_space_gb: float = 1.0
     max_local_storage_mb: int = 0
     purge_local_files_after_upload: bool = False
     keep_local_mirror: bool = True
-    purge_local_files_after_upload: bool = False
     tmpcrawl_dir: str = ""
     resume_dir: str = ""
 
@@ -94,25 +91,14 @@ class AWECConfig:
     checkpoint_path: str = ""
     language: str = "en"
     custom_language_file: str = ""
-
-    # First-run safety acknowledgement is intentionally persistent in config.
     safety_configured: bool = False
     safety_version: int = 1
 
-    def to_dict(self):
-        return asdict(self)
-
+    def to_dict(self): return asdict(self)
     def save(self, path: str | Path):
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-
+        p = Path(path); p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
     @classmethod
     def load(cls, path: str | Path):
         p = Path(path)
-        if not p.exists():
-            return cls()
-        data = json.loads(p.read_text(encoding="utf-8"))
-        valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
-        filtered = {k: v for k, v in data.items() if k in valid_keys}
-        return cls(**filtered)
+        if not p.exists(): return cls()
+        data = json.loads(p.read_text(encoding="utf-8")); valid_keys = {f.name for f in cls.__dataclass_fields__.values()}; return cls(**{k:v for k,v in data.items() if k in valid_keys})
