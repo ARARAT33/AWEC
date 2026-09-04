@@ -223,10 +223,23 @@ class SpoolPublisher:
                 continue
             self.store.update_upload_spool_status(item["id"], "uploading")
             ok, msg = self.uploader.upload_file_s3(p, item["remote_key"])
-            if ok and self.uploader.verify_remote_object(item["remote_key"], p.stat().st_size):
-                self.store.update_upload_spool_status(item["id"], "verified")
-                stats["success"] += 1
-            else:
-                self.store.update_upload_spool_status(item["id"], "failed", msg)
-                stats["failed"] += 1
+            if ok:
+                try:
+                    expected_size = p.stat().st_size
+                except OSError as exc:
+                    self.store.update_upload_spool_status(item["id"], "failed", f"Local file stat failed before verification: {exc}")
+                    stats["failed"] += 1
+                    continue
+                if self.uploader.verify_remote_object(item["remote_key"], expected_size):
+                    try:
+                        p.unlink()
+                    except OSError as exc:
+                        self.store.update_upload_spool_status(item["id"], "failed", f"IA verified but local delete failed: {exc}")
+                        stats["failed"] += 1
+                        continue
+                    self.store.update_upload_spool_status(item["id"], "verified")
+                    stats["success"] += 1
+                    continue
+            self.store.update_upload_spool_status(item["id"], "failed", msg)
+            stats["failed"] += 1
         return stats
