@@ -1,6 +1,6 @@
 """AWEC desktop engine bridge with portable storage and conservative resource usage."""
 from __future__ import annotations
-import asyncio, json, threading
+import asyncio, json, threading, re
 from pathlib import Path
 from urllib.parse import urlparse
 from PySide6.QtCore import QObject, Signal
@@ -31,16 +31,28 @@ class Engine(QObject):
         elif name=='crawler_error': self.log.emit(f"💥 {payload.get('message')}")
     def _archive(self):
         if not getattr(self.cfg,'destination_archive',True) or not getattr(self.cfg,'ia_access_key','') or not getattr(self.cfg,'ia_secret_key','') or not getattr(self.cfg,'ia_identifier',''): return None
-        return IAUploader(self.cfg.ia_access_key,self.cfg.ia_secret_key,self.cfg.ia_identifier,getattr(self.cfg,'ia_endpoint','https://s3.us.archive.org'),collection=getattr(self.cfg,'ia_collection',''),title=getattr(self.cfg,'ia_title',''),creator=getattr(self.cfg,'ia_creator',''),description=getattr(self.cfg,'ia_description',''))
+        raw_identifier=str(self.cfg.ia_identifier).strip()
+        # IAS3 bucket/item identifiers cannot contain spaces or arbitrary Unicode.
+        # Normalize a UI-entered item name to a valid IA identifier while keeping
+        # the configured title untouched.
+        identifier=re.sub(r"[^A-Za-z0-9_.-]+","-",raw_identifier).strip("-")[:100]
+        if identifier != raw_identifier:
+            self.log.emit(f"ℹ️ IA identifier normalized: {raw_identifier} → {identifier}")
+        return IAUploader(self.cfg.ia_access_key,self.cfg.ia_secret_key,identifier,getattr(self.cfg,'ia_endpoint','https://s3.us.archive.org'),collection=getattr(self.cfg,'ia_collection',''),title=getattr(self.cfg,'ia_title','') or raw_identifier,creator=getattr(self.cfg,'ia_creator',''),description=getattr(self.cfg,'ia_description',''))
     async def _run(self):
         seeds=list(getattr(self.cfg,'seeds',[]) or [])
         if not seeds: self.log.emit('❌ No seed URL configured'); return
-        paths=ensure_layout(Path(getattr(self.cfg,'storage_root','') or app_root())); root=Path(getattr(self.cfg,'fallback_dir','') or paths['fallback']); root.mkdir(parents=True,exist_ok=True); resume_dir=getattr(self.cfg,'resume_dir','') or None; uploader=self._archive(); bootstrap=list(seeds)
-        for seed in seeds:
-            p=urlparse(seed); origin=f"{p.scheme}://{p.netloc}"
-            for u in (origin+'/robots.txt',origin+'/sitemap.xml'):
-                if u not in bootstrap: bootstrap.append(u)
-        self._crawler=ResumableAWECrawler(bootstrap,self._policy(),on_event=self._event,output_dir=root,resume_dir=resume_dir,ia_uploader=uploader,archive_verify=True,purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),min_free_space_mb=max(256,int(getattr(self.cfg,'min_free_space_gb',1.)*1024)),max_local_mb=max(1,int(getattr(self.cfg,'max_storage_gb',10.)*1024)),keep_local_mirror=getattr(self.cfg,'keep_local_mirror',True))
+        paths=ensure_layout(Path(getattr(self.cfg,'storage_root','') or app_root())); root=Path(getattr(self.cfg,'fallback_dir','') or paths['fallback']); root.mkdir(parents=True,exist_ok=True); resume_dir=getattr(self.cfg,'resume_dir','') or None; uploader=self._archive()
+        # robots.txt and sitemap.xml are optional discovery resources. They are
+        # not crawler seeds: many valid sites return 404 for one or both, and a
+        # missing optional file must never stop/retry the real crawl.
+        self._crawler=ResumableAWECrawler(seeds,self._policy(),on_event=self._event,output_dir=root,resume_dir=resume_dir,ia_uploader=uploader,archive_verify=True,purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),min_free_space_mb=max(256,int(getattr(self.cfg,'min_free_space_gb',1.)*1024)),max_local_mb=max(1,int(getattr(self.cfg,'max_storage_gb',10.)*1024)),keep_local_mirror=getattr(self.cfg,'keep_local_mirror',True))
+        # The base crawler has an optional robots/sitemap bootstrap hook. AWEC
+        # handles robots policy separately, so disable that extra network work for
+        # the desktop mirror path and keep the crawl focused on actual resources.
+        async def _no_bootstrap():
+            return None
+        self._crawler._seed_bootstrap=_no_bootstrap
         self.log.emit(f'🌐 Seeds: {", ".join(seeds)}'); self.log.emit(f'🕸️ Concurrency: {self._policy().workers} workers'); self.log.emit(f'📦 AWEC storage: {paths["root"]} • quota={getattr(self.cfg,"max_storage_gb",10):g} GB • reserve={getattr(self.cfg,"min_free_space_gb",1):g} GB'); self.log.emit(f'🗂️ Data: {root} • persistent: {paths["config"]}, {paths["ia"]}')
         if uploader:self.log.emit('☁️ Internet Archive LIVE upload + verification enabled')
         await self._crawler.run(); s=self._crawler.stats; self.stats.emit({'queued':s.get('queued',0),'enqueued':s.get('enqueued',0),'fetched':s.get('pages',0)+s.get('files',0),'pages':s.get('pages',0),'found':s.get('files',0),'files':s.get('files',0),'downloaded':s.get('mirrored',0),'uploaded':s.get('uploaded',0),'mirrored':s.get('mirrored',0),'mirror_bytes':s.get('mirror_bytes',0),'errors':s.get('errors',0),'active':0,'speed':s.get('status','Completed'),'active_domain':s.get('active_domain',seeds[0])})
