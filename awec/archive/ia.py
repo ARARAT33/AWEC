@@ -130,6 +130,10 @@ class IAUploader:
             "Content-MD5": md5_b64,
             "x-archive-size-hint": str(size),
             "x-archive-queue-derive": "0",
+            # IAS3 requires this when the target item bucket has not yet been
+            # materialized for S3 writes. It is harmless for an existing item.
+            "x-amz-auto-make-bucket": "1",
+            "x-archive-keep-old-version": "1",
         }
         for name, value in self._metadata().items():
             if value:
