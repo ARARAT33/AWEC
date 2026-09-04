@@ -1,4 +1,4 @@
-"""AWEC v12 resumable crawler with broad resource discovery and live IA publishing."""
+"""AWEC v12 resumable crawler with low-overhead storage checks and IA publishing."""
 from __future__ import annotations
 
 import asyncio
@@ -20,7 +20,7 @@ from desktop.crawler_engine import AWECrawler as BaseCrawler
 
 
 class ResumableAWECrawler(BaseCrawler):
-    """Base crawler plus durable resume, storage guard and non-blocking live IA publication."""
+    """Base crawler plus durable resume, storage guard and low-overhead IA publication."""
 
     def __init__(self, seeds, policy, on_event=None, output_dir=None, resume_dir=None,
                  ia_uploader=None, archive_verify=True, purge_after_upload=False,
@@ -34,7 +34,17 @@ class ResumableAWECrawler(BaseCrawler):
         self.max_local_mb = max(0, int(max_local_mb or 0))
         self.uploaded = 0
         self.upload_failed = 0
-        self._upload_pool = ThreadPoolExecutor(max_workers=8) if ia_uploader else None
+        # IA publishing is deliberately small so uploads cannot consume the CPU
+        # budget needed by the crawler/parser/indexer.
+        self._upload_pool = ThreadPoolExecutor(max_workers=2) if ia_uploader else None
+        self._disk_check_at = 0.0
+        self._disk_ok_cache = True
+        self._local_bytes = 0
+        if self.max_local_mb:
+            try:
+                self._local_bytes = sum(p.stat().st_size for p in Path(self.mirror.root).rglob("*") if p.is_file())
+            except OSError:
+                self._local_bytes = 0
         if resume_dir:
             root = Path(resume_dir)
             self.crawl_id = root.name
@@ -51,15 +61,22 @@ class ResumableAWECrawler(BaseCrawler):
             self.on_event("crawl_resumed", {"crawl_id": self.crawl_id, "path": str(root)})
 
     def _disk_ok(self, extra_bytes=0):
+        # The previous implementation recursively scanned every mirrored file on
+        # every request. On large crawls this became O(number_of_files) per fetch
+        # and could drive a desktop CPU to 100%. Cache the cheap filesystem check.
+        now = time.monotonic()
+        if now - self._disk_check_at < 0.75:
+            if self.max_local_mb:
+                return self._local_bytes + extra_bytes <= self.max_local_mb * 1024 * 1024
+            return self._disk_ok_cache
+        self._disk_check_at = now
         try:
             usage = shutil.disk_usage(self.mirror.root)
-            if usage.free - extra_bytes <= self.min_free_space_mb * 1024 * 1024:
-                return False
+            ok = usage.free - extra_bytes > self.min_free_space_mb * 1024 * 1024
             if self.max_local_mb:
-                current = sum(p.stat().st_size for p in self.mirror.root.rglob("*") if p.is_file())
-                if current + extra_bytes > self.max_local_mb * 1024 * 1024:
-                    return False
-            return True
+                ok = ok and self._local_bytes + extra_bytes <= self.max_local_mb * 1024 * 1024
+            self._disk_ok_cache = ok
+            return ok
         except OSError:
             return True
 
@@ -101,8 +118,6 @@ class ResumableAWECrawler(BaseCrawler):
             if self._in_scope(seed):
                 self.frontier.add_url(seed, depth=0, parent_url="", discovery_type="seed")
                 self.stats["enqueued"] += 1
-        # v12 engine historically seeds bootstrap URLs from desktop/engine.py.
-        # Keep the crawler itself self-contained for direct callers too.
         await self._seed_bootstrap()
         self.on_event("crawl_started", {"crawl_id": self.crawl_id, "seeds": self.seeds, "workers": self.policy.workers})
         try:
@@ -115,7 +130,7 @@ class ResumableAWECrawler(BaseCrawler):
                     self.on_event("storage_guard", {"message": "Temporary storage limit/free-space reserve reached."})
                     break
                 batch = []
-                for _ in range(max(1, min(self.policy.workers, 64))):
+                for _ in range(max(1, min(self.policy.workers, 8))):
                     item = self.frontier.pop_next()
                     if not item:
                         break
@@ -129,6 +144,7 @@ class ResumableAWECrawler(BaseCrawler):
                         self.on_event("crawler_error", {"message": str(result)})
                 self.stats["queued"] = self.frontier.get_stats().get("pending", 0)
                 self.stats["uploaded"] = self.uploaded
+                await asyncio.sleep(0)
         finally:
             if self._upload_pool:
                 await asyncio.get_running_loop().run_in_executor(None, self._upload_pool.shutdown, True)
@@ -158,6 +174,7 @@ class ResumableAWECrawler(BaseCrawler):
         self.stats["pages" if "html" in ct else "files"] += 1
         self.stats["bytes"] += len(payload)
         local_path = self.mirror.save(res.final_url, payload, res.content_type, res.status, res.response_headers)
+        self._local_bytes += len(payload)
         self.stats["mirrored"] += 1
         self.stats["mirror_bytes"] += len(payload)
         rec = ResourceRecord(
@@ -175,9 +192,6 @@ class ResumableAWECrawler(BaseCrawler):
         rec.warc_length = w_len
         self.store.save_resource(rec)
         self.frontier.mark_completed(item["id"])
-
-        # Never wait for IA on the critical crawl path. Local/WARC persistence is complete
-        # first; the publisher drains independently and failures remain visible.
         if self.ia_uploader and self._upload_pool:
             self._upload_pool.submit(self._publish, local_path, res.final_url, res.content_type, len(payload))
 
