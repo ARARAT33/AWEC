@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio, json, threading
 from pathlib import Path
+from urllib.parse import urlparse
 from PySide6.QtCore import QObject, Signal
 from desktop.crawler_engine import CrawlPolicy
 from desktop.crawler_engine_v12 import ResumableAWECrawler
@@ -16,24 +17,9 @@ class Engine(QObject):
     def _policy(self):
         depth=getattr(self.cfg,'max_depth',0); depth=100000 if depth<=0 else depth
         try:
-            headers=json.loads(getattr(self.cfg,'custom_headers_json','{}') or '{}')
-            headers=headers if isinstance(headers,dict) else {}
+            headers=json.loads(getattr(self.cfg,'custom_headers_json','{}') or '{}'); headers=headers if isinstance(headers,dict) else {}
         except Exception: headers={}
-        return CrawlPolicy(
-            network_mode=getattr(self.cfg,'network_mode','standard'),
-            follow_links=getattr(self.cfg,'follow_links',True),
-            follow_external_domains=getattr(self.cfg,'follow_external_domains',False),
-            include_subdomains=True, download_files=True,
-            respect_robots=getattr(self.cfg,'respect_robots',True), max_depth=depth,
-            max_file_size=getattr(self.cfg,'max_file_size',-1), file_types=['*'],
-            workers=max(1,getattr(self.cfg,'workers',32)),
-            rate_limit_per_host=max(0.0,getattr(self.cfg,'per_host_delay',0.15)),
-            retry_delays=[2,5,15,30], ua_rotation=getattr(self.cfg,'ua_rotation_enabled',True),
-            delay_jitter=max(0.0,getattr(self.cfg,'delay_jitter_sec',0.25)),
-            auto_headers=getattr(self.cfg,'auto_headers_enabled',True), verify_ssl=getattr(self.cfg,'verify_ssl',True),
-            proxy_url=getattr(self.cfg,'proxy_url',''), custom_headers=headers,
-            max_local_mb=getattr(self.cfg,'max_local_storage_mb',0),
-            purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False), mirror_all_resources=True)
+        return CrawlPolicy(network_mode=getattr(self.cfg,'network_mode','standard'),follow_links=getattr(self.cfg,'follow_links',True),follow_external_domains=getattr(self.cfg,'follow_external_domains',False),include_subdomains=True,download_files=True,respect_robots=getattr(self.cfg,'respect_robots',True),max_depth=depth,max_file_size=getattr(self.cfg,'max_file_size',-1),file_types=['*'],workers=max(1,getattr(self.cfg,'workers',32)),rate_limit_per_host=max(0.0,getattr(self.cfg,'per_host_delay',0.15)),retry_delays=[2,5,15,30],ua_rotation=getattr(self.cfg,'ua_rotation_enabled',True),delay_jitter=max(0.0,getattr(self.cfg,'delay_jitter_sec',0.25)),auto_headers=getattr(self.cfg,'auto_headers_enabled',True),verify_ssl=getattr(self.cfg,'verify_ssl',True),proxy_url=getattr(self.cfg,'proxy_url',''),custom_headers=headers,max_local_mb=getattr(self.cfg,'max_local_storage_mb',0),purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),mirror_all_resources=True)
 
     def _event(self,name,payload):
         if name=='crawl_started': self.log.emit('🚀 AWEC v12 • full reachable resource graph')
@@ -53,9 +39,16 @@ class Engine(QObject):
     async def _run(self):
         seeds=list(getattr(self.cfg,'seeds',[]) or [])
         if not seeds: self.log.emit('❌ No seed URL configured'); return
+        # Bootstrap common site indexes. They are crawled as ordinary resources and
+        # can expand the frontier even when navigation links are sparse.
+        bootstrap=list(seeds)
+        for seed in seeds:
+            p=urlparse(seed); origin=f"{p.scheme}://{p.netloc}"
+            for u in (origin+'/robots.txt',origin+'/sitemap.xml'):
+                if u not in bootstrap: bootstrap.append(u)
         root=Path(getattr(self.cfg,'tmpcrawl_dir','') or getattr(self.cfg,'fallback_dir','') or Path.home()/'AWEC'/'tmpcrawl'); root.mkdir(parents=True,exist_ok=True)
         uploader=self._archive(); resume_dir=getattr(self.cfg,'resume_dir','') or None
-        self._crawler=ResumableAWECrawler(seeds,self._policy(),on_event=self._event,output_dir=root,resume_dir=resume_dir,ia_uploader=uploader,archive_verify=getattr(self.cfg,'archive_verify_uploads',True),purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),min_free_space_mb=getattr(self.cfg,'min_free_space_mb',2048),max_local_mb=getattr(self.cfg,'max_local_storage_mb',0),keep_local_mirror=getattr(self.cfg,'keep_local_mirror',True))
+        self._crawler=ResumableAWECrawler(bootstrap,self._policy(),on_event=self._event,output_dir=root,resume_dir=resume_dir,ia_uploader=uploader,archive_verify=getattr(self.cfg,'archive_verify_uploads',True),purge_after_upload=getattr(self.cfg,'purge_local_files_after_upload',False),min_free_space_mb=getattr(self.cfg,'min_free_space_mb',2048),max_local_mb=getattr(self.cfg,'max_local_storage_mb',0),keep_local_mirror=getattr(self.cfg,'keep_local_mirror',True))
         self.log.emit(f'🌐 Seeds: {", ".join(seeds)}')
         self.log.emit(f'🕸️ Link mode: {"FOLLOW ALL NAVIGATION" if self._policy().follow_external_domains else "SEED SITE + EMBEDDED EXTERNAL ASSETS"} • embedded assets always fetched')
         self.log.emit(f'📦 tmpcrawl: {root} • limit={getattr(self.cfg,"max_local_storage_mb",0) or "UNLIMITED"} MB • reserve={getattr(self.cfg,"min_free_space_mb",2048)} MB')
