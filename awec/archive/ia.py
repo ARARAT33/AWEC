@@ -1,4 +1,4 @@
-"""Reliable Internet Archive uploader with a direct, explicit IAS3 PUT path."""
+"""Reliable Internet Archive uploader with an explicit IAS3 PUT path."""
 from __future__ import annotations
 
 import base64
@@ -11,10 +11,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import boto3
-import internetarchive
 import requests
 from internetarchive.auth import S3Auth
 
@@ -44,7 +43,7 @@ def _get_metadata(identifier: str) -> tuple[bool, dict | None, str]:
 
 
 class IAUploader:
-    """IA publisher using the IAS3 API directly, with deterministic Content-Length."""
+    """IAS3 publisher with deterministic request length and remote verification."""
     PREFLIGHT_TTL = 60.0
     MAX_RETRIES = 8
     REQUEST_TIMEOUT = (15, 300)
@@ -119,9 +118,8 @@ class IAUploader:
         return md
 
     def _ia_url(self, remote_key: str) -> str:
-        # IAS3 uses the item identifier as the bucket and UTF-8 URL-encoded keys.
         encoded_key = urllib.parse.quote(remote_key.lstrip("/"), safe="/-_.~")
-        return f"https://s3.us.archive.org/{self.identifier}/{encoded_key}"
+        return f"{self.endpoint_url}/{self.identifier}/{encoded_key}"
 
     def _upload_once(self, local_p: Path, remote_key: str, content_type: str, md5_b64: str) -> requests.Response:
         size = local_p.stat().st_size
@@ -136,11 +134,7 @@ class IAUploader:
         for name, value in self._metadata().items():
             if value:
                 headers[f"x-archive-meta-{name}"] = str(value)
-
         with local_p.open("rb") as fh:
-            # Explicit Content-Length is intentional: this bypasses the client-side
-            # None-vs-int size path that produced the observed '<=' TypeError and
-            # also avoids chunked transfer encoding, which IAS3 does not support.
             response = requests.put(
                 self._ia_url(remote_key),
                 data=fh,
@@ -151,7 +145,8 @@ class IAUploader:
         response.raise_for_status()
         return response
 
-    def upload_file_s3(self, local_path: Path | str, remote_key: str, content_type="application/octet-stream", metadata_headers=None):
+    def upload_file_s3(self, local_path: Path | str, remote_key: str,
+                       content_type="application/octet-stream", metadata_headers=None):
         local_p = Path(local_path)
         if not local_p.exists():
             return False, "LOCAL_FILE_NOT_FOUND"
@@ -160,7 +155,6 @@ class IAUploader:
         ok, msg = self.validate_destination()
         if not ok:
             return False, msg
-
         try:
             size = local_p.stat().st_size
             md5 = hashlib.md5(usedforsecurity=False)
@@ -168,21 +162,18 @@ class IAUploader:
                 for chunk in iter(lambda: fh.read(1024 * 1024), b""):
                     md5.update(chunk)
             md5_b64 = base64.b64encode(md5.digest()).decode("ascii")
-
-            # Preserve caller-provided content type while still enforcing the
-            # required Content-Length/MD5 headers above.
             if metadata_headers and metadata_headers.get("Content-Type"):
                 content_type = metadata_headers["Content-Type"]
 
             last_error = None
             for attempt in range(self.MAX_RETRIES + 1):
                 try:
-                    response = self._upload_once(local_p, remote_key, content_type, md5_b64)
+                    self._upload_once(local_p, remote_key, content_type, md5_b64)
                     self._item_cache = (time.monotonic(), True, f"ITEM_FOUND: {self.identifier}")
                     return True, f"ITEM_EXISTS/CREATED: {self.identifier} • UPLOAD_SUCCESS • {size} bytes"
                 except requests.HTTPError as exc:
-                    response = exc.response
                     last_error = exc
+                    response = exc.response
                     if response is None or response.status_code != 503 or attempt >= self.MAX_RETRIES:
                         raise
                 except (requests.ConnectionError, requests.Timeout) as exc:
@@ -200,8 +191,10 @@ class IAUploader:
             return False, f"IA_UPLOAD_ERROR_{err}"
 
     def _client(self):
-        return boto3.client("s3", endpoint_url=self.endpoint_url, aws_access_key_id=self.access_key,
-                            aws_secret_access_key=self.secret_key, region_name="us-east-1")
+        return boto3.client("s3", endpoint_url=self.endpoint_url,
+                            aws_access_key_id=self.access_key,
+                            aws_secret_access_key=self.secret_key,
+                            region_name="us-east-1")
 
     def verify_remote_object(self, remote_key, expected_size, retries=5):
         for attempt in range(max(1, retries)):
