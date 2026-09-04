@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""AWEC Desktop entry point."""
+"""AWEC Desktop v11 entry point."""
 import sys
 from PySide6.QtWidgets import QApplication
 from desktop.theme import apply_theme
-from desktop.app_window_v10 import AWECMainWindow
+from desktop.app_window_v11 import AWECMainWindow
 
 
 def main():
