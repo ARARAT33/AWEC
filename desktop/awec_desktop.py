@@ -6,13 +6,13 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from desktop.app_window_lite import AWECMainWindow
-from desktop.theme import apply_theme
+from desktop.lite_theme import apply_lite_theme
 
 
 def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setStyle("Fusion")
-    apply_theme(app)
+    apply_lite_theme(app)
     window = AWECMainWindow()
     window.show()
     return app.exec()
