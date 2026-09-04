@@ -637,6 +637,8 @@ class AWECMainWindow(QMainWindow):
     def add_seed_site(self):
         url = self.site_input.text().strip()
         if url:
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
             if not any(self.site_list_widget.item(i).text() == url for i in range(self.site_list_widget.count())):
                 self.site_list_widget.addItem(url)
             self.site_input.clear()
@@ -756,15 +758,30 @@ class AWECMainWindow(QMainWindow):
     # ── Crawler Execution ───────────────────────────────────────
     def start_crawl(self):
         if self.site_list_widget.count() == 0:
-            QMessageBox.warning(self, "AWEC", "Please add at least one seed site before starting.")
-            return
+            url = self.site_input.text().strip()
+            if url:
+                if not url.startswith(("http://", "https://")):
+                    url = "https://" + url
+                self.site_list_widget.addItem(url)
+                self.site_input.clear()
+            else:
+                QMessageBox.warning(self, "AWEC", "Please add at least one seed site before starting.")
+                return
 
         if self.engine and self.engine.stop_event and not self.engine.stop_event.is_set():
             if getattr(self.engine, 'is_paused', False):
                 self.engine.is_paused = False
                 self.update_status_badge("running")
                 self.append_log("▶ Crawl resumed")
+                self.btn_start.setEnabled(False)
                 return
+
+        # Clean up any leftover thread before starting fresh
+        if self.thread and self.thread.isRunning():
+            if self.engine:
+                self.engine.stop()
+            self.thread.quit()
+            self.thread.wait()
 
         cfg = self.build_config_from_ui()
         self.engine = Engine(cfg)
