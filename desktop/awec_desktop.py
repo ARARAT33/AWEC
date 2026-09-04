@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-"""AWEC Desktop v11 entry point."""
+"""AWEC Desktop v12 entry point."""
 import sys
 from PySide6.QtWidgets import QApplication
 from desktop.theme import apply_theme
-from desktop.app_window_v11 import AWECMainWindow
-
+from desktop.app_window_v12 import AWECMainWindow
 
 def main():
-    app = QApplication.instance() or QApplication(sys.argv)
-    app.setStyle("Fusion")
-    apply_theme(app)
-    window = AWECMainWindow()
-    window.show()
+    app=QApplication.instance() or QApplication(sys.argv)
+    app.setStyle('Fusion'); apply_theme(app)
+    window=AWECMainWindow(); window.show()
     return app.exec()
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__=='__main__': sys.exit(main())
