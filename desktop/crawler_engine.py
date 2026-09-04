@@ -37,11 +37,12 @@ class CrawlPolicy:
     max_depth: int = 100000
     max_file_size: int = -1
     file_types: list[str] = field(default_factory=lambda: ["*"])
-    workers: int = 32
-    rate_limit_per_host: float = 0.5
-    retry_delays: list[int] = field(default_factory=lambda: [2, 5, 15, 30])
+    # High-throughput defaults without disabling robots/SSRF/access-control protections.
+    workers: int = 48
+    rate_limit_per_host: float = 8.0
+    retry_delays: list[int] = field(default_factory=lambda: [1, 3, 8, 20])
     ua_rotation: bool = True
-    delay_jitter: float = 0.25
+    delay_jitter: float = 0.15
     auto_headers: bool = True
     verify_ssl: bool = True
     proxy_url: str = ""
@@ -54,9 +55,7 @@ class CrawlPolicy:
 class AWECrawler:
     """Mirror the reachable resource graph, not just HTML pages."""
 
-    EMBEDDED_RESOURCE_KINDS = {
-        "stylesheet", "icon", "image", "script", "media", "css_resource", "js_literal"
-    }
+    EMBEDDED_RESOURCE_KINDS = {"stylesheet", "icon", "image", "script", "media", "css_resource", "js_literal"}
 
     def __init__(self, seeds: list[str], policy: CrawlPolicy, on_event=None, output_dir=None):
         self.seeds = seeds
@@ -82,28 +81,39 @@ class AWECrawler:
             custom_headers=policy.custom_headers,
             download_files=True,
             allowed_mime_types=["*"],
-            global_concurrency=policy.workers,
+            global_concurrency=max(1, policy.workers),
+            concurrency_per_host=min(24, max(4, policy.workers // 2)),
+            request_rate_per_sec=max(0.1, policy.rate_limit_per_host),
+            max_retries=8,
+            request_timeout=45,
         )
         fanti_cfg = FANTIConfig(
-            network_mode="fanti", delay_jitter=policy.delay_jitter,
-            verify_tls=policy.verify_ssl, proxy_url=policy.proxy_url,
+            network_mode="fanti",
+            delay_jitter=policy.delay_jitter,
+            initial_delay=0.15,
+            min_delay=0.05,
+            max_delay=8.0,
+            initial_concurrency=min(8, max(2, policy.workers // 6)),
+            min_concurrency=1,
+            max_concurrency=min(32, max(8, policy.workers)),
+            max_connections=min(160, max(64, policy.workers * 3)),
+            max_connections_per_host=min(32, max(12, policy.workers // 2)),
+            verify_tls=policy.verify_ssl,
+            proxy_url=policy.proxy_url,
             custom_headers=policy.custom_headers,
-            max_connections=max(32, policy.workers * 2),
+            max_retries=5,
         )
         self.fetcher = FANTIFetcher(fanti_cfg, self.store) if policy.network_mode == "fanti" else StandardFetcher(core_policy, self.store)
         self.paused = False
         self.stopped = False
-        self.stats = {"status": "AWEC Stopped", "pages": 0, "files": 0, "bytes": 0,
-                      "errors": 0, "queued": 0, "enqueued": 0, "retries": 0,
-                      "mirrored": 0, "mirror_bytes": 0, "discovered": 0,
-                      "rejected": 0, "active_domain": ""}
+        self.stats = {"status": "AWEC Stopped", "pages": 0, "files": 0, "bytes": 0, "errors": 0,
+                      "queued": 0, "enqueued": 0, "retries": 0, "mirrored": 0, "mirror_bytes": 0,
+                      "discovered": 0, "rejected": 0, "active_domain": ""}
 
     @staticmethod
     def _registrable_host(host: str) -> str:
         host = (host or "").lower().rstrip(".")
-        if host.startswith("www."):
-            host = host[4:]
-        return host
+        return host[4:] if host.startswith("www.") else host
 
     def _same_site(self, host: str, seed_host: str) -> bool:
         host = self._registrable_host(host)
@@ -114,9 +124,6 @@ class AWECrawler:
         host = (urlparse(url).hostname or "").lower()
         if not host:
             return False
-        # Resources actually embedded/displayed by a crawled page are always eligible,
-        # including CDN assets on another host. Navigation to arbitrary external pages
-        # remains a separate user-controlled option.
         if embedded_kind in self.EMBEDDED_RESOURCE_KINDS:
             return True
         if self.policy.follow_external_domains:
@@ -132,7 +139,6 @@ class AWECrawler:
         return True
 
     async def _seed_bootstrap(self):
-        """Seed robots/sitemap discovery so large sites are not limited to navigation links."""
         for seed in self.seeds:
             p = urlparse(seed)
             origin = f"{p.scheme}://{p.netloc}"
@@ -148,14 +154,14 @@ class AWECrawler:
                 self.frontier.add_url(seed, depth=0, parent_url="", discovery_type="seed")
                 self.stats["enqueued"] += 1
         await self._seed_bootstrap()
-        self.on_event("crawl_started", {"crawl_id": self.crawl_id, "seeds": self.seeds})
+        self.on_event("crawl_started", {"crawl_id": self.crawl_id, "seeds": self.seeds, "workers": self.policy.workers})
         try:
             while not self.stopped:
                 if self.paused:
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.15)
                     continue
                 batch = []
-                for _ in range(max(1, min(self.policy.workers, 32))):
+                for _ in range(max(1, min(self.policy.workers, 64))):
                     item = self.frontier.pop_next()
                     if not item:
                         break
@@ -181,7 +187,7 @@ class AWECrawler:
         if not (200 <= res.status < 400):
             self.stats["errors"] += 1
             self.stats["retries"] += 1
-            self.frontier.mark_failed(item["id"], retry_delay=5.0)
+            self.frontier.mark_failed(item["id"], retry_delay=3.0)
             self.on_event("request_failed", {"url": url, "status": res.status})
             return
         payload = res.wire_bytes
@@ -195,10 +201,9 @@ class AWECrawler:
         self.stats["mirrored"] += 1
         self.stats["mirror_bytes"] += len(payload)
         rec = ResourceRecord(
-            id=uuid.uuid4().hex, requested_url=url, final_url=res.final_url,
-            canonical_url=res.canonical_url, parent_url=item.get("parent_url", ""),
-            discovery_type=item.get("discovery_type", "html_link"), status=res.status,
-            request_headers=res.request_headers, response_headers=res.response_headers,
+            id=uuid.uuid4().hex, requested_url=url, final_url=res.final_url, canonical_url=res.canonical_url,
+            parent_url=item.get("parent_url", ""), discovery_type=item.get("discovery_type", "html_link"),
+            status=res.status, request_headers=res.request_headers, response_headers=res.response_headers,
             content_type=res.content_type, wire_size=len(payload), decoded_size=len(res.decoded_bytes),
             sha256_wire=res.wire_hash, sha256_decoded=res.decoded_hash,
             downloaded_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), duration_ms=res.duration_ms,
@@ -225,11 +230,9 @@ class AWECrawler:
             for u in ContentExtractor.parse_sitemap(payload, res.final_url.lower().endswith(".gz")):
                 discovered.append((u, "sitemap_url", "text/html"))
             if "robots" in urlparse(res.final_url).path.lower():
-                text = body
-                for line in text.splitlines():
+                for line in body.splitlines():
                     if line.lower().strip().startswith("sitemap:"):
-                        u = line.split(":", 1)[1].strip()
-                        discovered.append((u, "sitemap", "application/xml"))
+                        discovered.append((line.split(":", 1)[1].strip(), "sitemap", "application/xml"))
         self.stats["discovered"] += len(discovered)
         for ext_url, disc_type, mime_hint in discovered:
             if self._should_queue(ext_url, mime_hint, disc_type):
