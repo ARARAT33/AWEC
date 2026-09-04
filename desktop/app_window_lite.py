@@ -63,6 +63,7 @@ class AWECMainWindow(V5MainWindow):
         section = QLabel("WORKSPACE"); section.setObjectName("menuSection"); layout.addWidget(section)
         self.nav = {}
         group = QButtonGroup(self); group.setExclusive(True)
+        # Keep the existing menu order and labels unchanged.
         items = (
             ("dashboard", "⌂  Dashboard"),
             ("sites", "◎  Seed Sites"),
@@ -84,7 +85,8 @@ class AWECMainWindow(V5MainWindow):
             layout.addWidget(status)
 
     def _build_storage_page(self):
-        p = QWidget(); l = QVBoxLayout(p); l.setContentsMargins(24, 22, 24, 22); l.setSpacing(12)
+        p = QWidget(); self.storage_page = p
+        l = QVBoxLayout(p); l.setContentsMargins(24, 22, 24, 22); l.setSpacing(12)
         l.addWidget(QLabel("Storage & S3", objectName="pageHeader"))
         l.addWidget(QLabel("Lightweight local storage policy and destination overview.", objectName="pageSubtitle"))
         box = QGroupBox("Local Storage")
@@ -100,7 +102,8 @@ class AWECMainWindow(V5MainWindow):
         l.addStretch(1); self.pages.addWidget(p)
 
     def _build_language_page(self):
-        p = QWidget(); l = QVBoxLayout(p); l.setContentsMargins(24, 22, 24, 22); l.setSpacing(10)
+        p = QWidget(); self.language_page = p
+        l = QVBoxLayout(p); l.setContentsMargins(24, 22, 24, 22); l.setSpacing(10)
         l.addWidget(QLabel("Languages & Custom Language Studio", objectName="pageHeader"))
         l.addWidget(QLabel("Built-in languages plus editable .awec.language packs. Changes apply without restarting the crawler.", objectName="pageSubtitle"))
 
@@ -165,7 +168,7 @@ class AWECMainWindow(V5MainWindow):
 
     def _apply_language(self):
         t = self._language_values
-        # Keep the fast UI but translate all major navigation/actions immediately.
+        # Translate labels by their own semantic key; storage and languages are never cross-wired.
         labels = {
             "dashboard": t.get("dashboard", "Dashboard"), "sites": t.get("sites", "Seed Sites"),
             "crawler": t.get("crawler", "Crawler"), "storage": t.get("storage", "Storage & S3"),
@@ -209,7 +212,15 @@ class AWECMainWindow(V5MainWindow):
         self._export_language()
 
     def _page(self, key):
-        indexes = {"dashboard": 0, "sites": 1, "crawler": 2, "ia": 3, "logs": 4, "storage": 5, "languages": 6}
-        if hasattr(self, "pages") and key in indexes:
-            self.pages.setCurrentIndex(indexes[key])
+        # Use actual page widgets for the appended pages, so Storage and Languages
+        # cannot be swapped by numeric index changes elsewhere in the UI.
+        if key == "storage" and hasattr(self, "storage_page"):
+            self.pages.setCurrentWidget(self.storage_page)
+        elif key == "languages" and hasattr(self, "language_page"):
+            self.pages.setCurrentWidget(self.language_page)
+        else:
+            indexes = {"dashboard": 0, "sites": 1, "crawler": 2, "ia": 3, "logs": 4}
+            if hasattr(self, "pages") and key in indexes:
+                self.pages.setCurrentIndex(indexes[key])
+        if key in getattr(self, "nav", {}):
             for k, b in self.nav.items(): b.setChecked(k == key)
