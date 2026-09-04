@@ -293,6 +293,12 @@ class AWECMainWindow(QMainWindow):
         self.grp_network = QGroupBox("Anti-Blocking & Deep Network Settings")
         net_form = QFormLayout(self.grp_network)
 
+        self.combo_net_mode = QComboBox()
+        self.combo_net_mode.addItem("STANDARD (Simple, Predictable, Default)", "standard")
+        self.combo_net_mode.addItem("FANTI (Advanced Flexible Transport & Resilience)", "fanti")
+        self.lbl_net_mode = QLabel("Crawler Network Mode:")
+        net_form.addRow(self.lbl_net_mode, self.combo_net_mode)
+
         self.input_ua = QLineEdit(self.config.custom_user_agent)
         self.lbl_ua = QLabel("User-Agent:")
         net_form.addRow(self.lbl_ua, self.input_ua)
@@ -722,6 +728,7 @@ class AWECMainWindow(QMainWindow):
 
         cfg = AWECConfig(
             seeds=seeds,
+            network_mode=self.combo_net_mode.currentData() or "standard",
             workers=self.spin_workers.value(),
             max_depth=self.spin_depth.value(),
             max_urls=self.spin_max_urls.value(),

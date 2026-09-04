@@ -117,10 +117,74 @@ class StateStore:
                     updated_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS host_memory (
+                    domain TEXT PRIMARY KEY,
+                    concurrency INTEGER DEFAULT 4,
+                    delay REAL DEFAULT 0.5,
+                    timeout REAL DEFAULT 30.0,
+                    retries INTEGER DEFAULT 5,
+                    ua_profile TEXT DEFAULT 'archive',
+                    state TEXT DEFAULT 'HEALTHY',
+                    circuit_state TEXT DEFAULT 'CLOSED',
+                    consecutive_failures INTEGER DEFAULT 0,
+                    last_failure_ts REAL DEFAULT 0.0,
+                    avg_latency_ms REAL DEFAULT 0.0,
+                    success_rate REAL DEFAULT 100.0,
+                    updated_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS link_graph (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_url TEXT,
+                    target_url TEXT,
+                    discovery_type TEXT,
+                    crawl_id TEXT,
+                    relationship_type TEXT DEFAULT 'link',
+                    created_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS worker_leases (
+                    lease_id TEXT PRIMARY KEY,
+                    worker_id TEXT,
+                    resource_id INTEGER,
+                    url TEXT,
+                    domain TEXT,
+                    lease_time REAL,
+                    expires_at REAL
+                );
+
+                CREATE TABLE IF NOT EXISTS upload_spool (
+                    id TEXT PRIMARY KEY,
+                    crawl_id TEXT,
+                    local_path TEXT,
+                    remote_key TEXT,
+                    target_backend TEXT, -- internet-archive, s3, local
+                    status TEXT DEFAULT 'pending', -- pending, uploading, uploaded, verified, failed
+                    attempts INTEGER DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                );
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS fts_search USING fts5(
+                    resource_id UNINDEXED,
+                    url,
+                    title,
+                    headings,
+                    body_text,
+                    description,
+                    domain,
+                    language,
+                    tokenize = 'unicode61'
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_frontier_domain_status ON frontier(domain, status);
                 CREATE INDEX IF NOT EXISTS idx_urls_canonical ON urls(canonical_url);
                 CREATE INDEX IF NOT EXISTS idx_resources_canonical ON resources(canonical_url);
                 CREATE INDEX IF NOT EXISTS idx_resources_wire_hash ON resources(sha256_wire);
+                CREATE INDEX IF NOT EXISTS idx_link_graph_src ON link_graph(source_url);
+                CREATE INDEX IF NOT EXISTS idx_link_graph_target ON link_graph(target_url);
+                CREATE INDEX IF NOT EXISTS idx_upload_spool_status ON upload_spool(status);
             """)
 
     def save_checkpoint(self, key: str, data: Dict[str, Any]) -> None:
@@ -167,4 +231,87 @@ class StateStore:
     def get_resources(self) -> List[Dict[str, Any]]:
         with self.lock, self._get_conn() as conn:
             cur = conn.execute("SELECT * FROM resources")
+            return [dict(r) for r in cur.fetchall()]
+
+    def index_search_doc(self, resource_id: str, url: str, title: str, headings: str, body_text: str, description: str, domain: str, language: str) -> None:
+        with self.lock, self._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO fts_search (resource_id, url, title, headings, body_text, description, domain, language)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (resource_id, url, title, headings, body_text, description, domain, language))
+            conn.commit()
+
+    def search(self, query: str, domain: str = "", language: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+        if not query.strip():
+            return []
+        sql = "SELECT resource_id, url, title, description, domain, language, bm25(fts_search) as score FROM fts_search WHERE fts_search MATCH ?"
+        params: List[Any] = [query]
+        if domain:
+            sql += " AND domain = ?"
+            params.append(domain.lower())
+        if language:
+            sql += " AND language = ?"
+            params.append(language.lower())
+        sql += " ORDER BY score ASC LIMIT ?"
+        params.append(limit)
+
+        with self.lock, self._get_conn() as conn:
+            cur = conn.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+    def save_host_profile(self, profile: Dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock, self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO host_memory (
+                    domain, concurrency, delay, timeout, retries, ua_profile, state, circuit_state,
+                    consecutive_failures, last_failure_ts, avg_latency_ms, success_rate, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                profile["domain"], profile.get("concurrency", 4), profile.get("delay", 0.5),
+                profile.get("timeout", 30.0), profile.get("retries", 5), profile.get("ua_profile", "archive"),
+                profile.get("state", "HEALTHY"), profile.get("circuit_state", "CLOSED"),
+                profile.get("consecutive_failures", 0), profile.get("last_failure_ts", 0.0),
+                profile.get("avg_latency_ms", 0.0), profile.get("success_rate", 100.0), now
+            ))
+            conn.commit()
+
+    def get_host_profile(self, domain: str) -> Optional[Dict[str, Any]]:
+        with self.lock, self._get_conn() as conn:
+            cur = conn.execute("SELECT * FROM host_memory WHERE domain = ?", (domain.lower(),))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def add_link_edge(self, source_url: str, target_url: str, discovery_type: str, crawl_id: str, relationship_type: str = "link") -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock, self._get_conn() as conn:
+            conn.execute("""
+                INSERT INTO link_graph (source_url, target_url, discovery_type, crawl_id, relationship_type, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (source_url, target_url, discovery_type, crawl_id, relationship_type, now))
+            conn.commit()
+
+    def save_upload_spool(self, spool_id: str, crawl_id: str, local_path: str, remote_key: str, target_backend: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock, self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO upload_spool (
+                    id, crawl_id, local_path, remote_key, target_backend, status, attempts, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+            """, (spool_id, crawl_id, local_path, remote_key, target_backend, now, now))
+            conn.commit()
+
+    def update_upload_spool_status(self, spool_id: str, status: str, last_error: str = "") -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.lock, self._get_conn() as conn:
+            conn.execute("""
+                UPDATE upload_spool
+                SET status = ?, attempts = attempts + 1, last_error = ?, updated_at = ?
+                WHERE id = ?
+            """, (status, last_error, now, spool_id))
+            conn.commit()
+
+    def get_pending_uploads(self) -> List[Dict[str, Any]]:
+        with self.lock, self._get_conn() as conn:
+            cur = conn.execute("SELECT * FROM upload_spool WHERE status IN ('pending', 'failed') AND attempts < 5")
             return [dict(r) for r in cur.fetchall()]
