@@ -51,18 +51,44 @@ class Engine(QObject):
     def stop(self):
         self.stop_event.set()
 
-    def emit(self):
+    def enforce_storage_quota(self):
+        max_mb = getattr(self.cfg, "max_local_storage_mb", 50)
+        fallback_dir = Path(getattr(self.cfg, "fallback_dir", "fallback"))
+        if max_mb <= 0 or not fallback_dir.exists():
+            return
+
+        max_bytes = max_mb * 1024 * 1024
+        files = []
+        for p in fallback_dir.rglob("*"):
+            if p.is_file():
+                files.append((p.stat().st_mtime, p.stat().st_size, p))
+
+        files.sort(key=lambda x: x[0])  # oldest first
+        current_size = sum(f[1] for f in files)
+
+        for mtime, fsize, p in files:
+            if current_size <= max_bytes:
+                break
+            try:
+                p.unlink()
+                current_size -= fsize
+            except Exception:
+                pass
+
+    def emit(self, current_domain: str = "—", q_size: int = 0):
         self.stats.emit({
-            "queued": 0,
+            "queued": q_size,
             "enqueued": self.enqueued,
             "fetched": self.fetched,
             "pages": self.fetched,
+            "found": self.files_found,
             "files": self.files_found,
             "downloaded": self.uploaded,
             "uploaded": self.uploaded,
             "errors": self.errors,
             "active": self.active,
-            "speed": "Active"
+            "speed": f"{self.active} Active" if self.active > 0 else "Idle",
+            "active_domain": current_domain
         })
 
     def ext_ok(self, url: str, ctype: str = "") -> bool:
@@ -127,7 +153,7 @@ class Engine(QObject):
             if tmp_file.exists():
                 tmp_file.unlink()
 
-    async def fetch(self, session, item, q, seen, host_next, robots):
+    async def fetch(self, session, item, q, seen, host_next, robots, seed_hosts):
         url, depth, source = item
         canonical_url = URLCanonicalizer.canonicalize(url)
         host = urlparse(canonical_url).netloc.lower()
@@ -137,8 +163,22 @@ class Engine(QObject):
             self.log.emit(f"🛡️ SSRF Blocked {canonical_url}: {ssrf_reason}")
             return
 
-        base_delay = getattr(self.cfg, "per_host_delay", 0.5)
-        jitter = getattr(self.cfg, "delay_jitter_sec", 0.25)
+        # Domain restriction check
+        if getattr(self.cfg, "same_domain_only", True):
+            if seed_hosts and host not in seed_hosts:
+                return
+
+        # Robots.txt compliance check
+        if getattr(self.cfg, "respect_robots", True):
+            if host not in robots:
+                rm = RobotsManager(user_agent="AWEC/3.0")
+                robots[host] = rm
+            if not robots[host].can_fetch(canonical_url):
+                self.log.emit(f"🚫 Robots.txt blocked: {canonical_url}")
+                return
+
+        base_delay = getattr(self.cfg, "per_host_delay", 0.1)
+        jitter = getattr(self.cfg, "delay_jitter_sec", 0.1)
         delay = base_delay + random.uniform(0, max(0.0, jitter))
 
         wait = host_next.get(host, 0) - time.monotonic()
@@ -157,6 +197,12 @@ class Engine(QObject):
                     wire_bytes = await r.read()
                     final_url = str(r.url)
                     self.fetched += 1
+
+                    # File size check
+                    max_file_size = getattr(self.cfg, "max_file_size", -1)
+                    if max_file_size > 0 and len(wire_bytes) > max_file_size:
+                        self.log.emit(f"⚠️ Skipped {final_url}: size {len(wire_bytes)} exceeds max limit {max_file_size}")
+                        break
 
                     payload = process_payload(wire_bytes, r.headers.get("content-encoding", ""))
                     text = payload.decoded_bytes.decode(r.charset or "utf-8", errors="ignore")
@@ -201,19 +247,50 @@ class Engine(QObject):
                             fallback.mkdir(parents=True, exist_ok=True)
                             local_path = fallback / f"{rec.id[:8]}_{filename}"
                             local_path.write_bytes(payload.decoded_bytes)
+                            self.enforce_storage_quota()
 
-                    if "text/html" in ctype.lower():
+                    # Deep link and resource extraction
+                    extracted_urls = []
+                    max_depth = getattr(self.cfg, "max_depth", 8)
+
+                    if "text/html" in ctype.lower() or "application/xhtml+xml" in ctype.lower():
                         try:
-                            extracted = ContentExtractor.extract_html_links(final_url, text)
-                            for u, d_type, _ in extracted:
-                                c_u = URLCanonicalizer.canonicalize(u)
-                                max_depth = getattr(self.cfg, "max_depth", 8)
-                                if depth < max_depth and c_u not in seen:
-                                    seen.add(c_u)
-                                    await q.put((c_u, depth + 1, final_url))
-                                    self.enqueued += 1
+                            html_links = ContentExtractor.extract_html_links(final_url, text)
+                            extracted_urls.extend([u for u, _, _ in html_links])
                         except Exception as parse_err:
-                            self.log.emit(f"⚠️ Content extraction warning on {final_url}: {parse_err}")
+                            self.log.emit(f"⚠️ HTML link extraction warning on {final_url}: {parse_err}")
+                    elif "text/css" in ctype.lower():
+                        try:
+                            css_links = ContentExtractor.extract_css_links(final_url, text)
+                            extracted_urls.extend([u for u, _, _ in css_links])
+                        except Exception as parse_err:
+                            self.log.emit(f"⚠️ CSS link extraction warning on {final_url}: {parse_err}")
+                    elif "javascript" in ctype.lower():
+                        try:
+                            js_links = ContentExtractor.extract_js_links(final_url, text)
+                            extracted_urls.extend([u for u, _, _ in js_links])
+                        except Exception as parse_err:
+                            self.log.emit(f"⚠️ JS link extraction warning on {final_url}: {parse_err}")
+                    elif "xml" in ctype.lower() or "sitemap" in final_url.lower():
+                        try:
+                            sitemap_urls = ContentExtractor.parse_sitemap(payload.decoded_bytes)
+                            extracted_urls.extend(sitemap_urls)
+                        except Exception as parse_err:
+                            self.log.emit(f"⚠️ Sitemap parsing warning on {final_url}: {parse_err}")
+
+                    max_urls = getattr(self.cfg, "max_urls", 0)
+                    for u in extracted_urls:
+                        c_u = URLCanonicalizer.canonicalize(u)
+                        if max_urls > 0 and self.enqueued >= max_urls:
+                            break
+                        if depth < max_depth and c_u not in seen:
+                            u_host = urlparse(c_u).netloc.lower()
+                            if getattr(self.cfg, "same_domain_only", True) and seed_hosts and u_host not in seed_hosts:
+                                continue
+                            seen.add(c_u)
+                            await q.put((c_u, depth + 1, final_url))
+                            self.enqueued += 1
+
                     break
             except Exception as e:
                 if attempt >= retries:
@@ -230,12 +307,17 @@ class Engine(QObject):
         host_next = {}
         robots = {}
 
+        seed_hosts = set()
         for s in self.cfg.seeds:
             u = URLCanonicalizer.canonicalize(s)
-            if u and u not in seen:
-                seen.add(u)
-                await q.put((u, 0, "seed"))
-                self.enqueued += 1
+            if u:
+                sh = urlparse(u).netloc.lower()
+                if sh:
+                    seed_hosts.add(sh)
+                if u not in seen:
+                    seen.add(u)
+                    await q.put((u, 0, "seed"))
+                    self.enqueued += 1
 
         if q.empty():
             self.log.emit("⚠️ No valid seeds found.")
@@ -258,12 +340,13 @@ class Engine(QObject):
                         continue
 
                     self.active += 1
+                    cur_host = urlparse(item[0]).netloc.lower() if item else "—"
                     try:
-                        await self.fetch(session, item, q, seen, host_next, robots)
+                        await self.fetch(session, item, q, seen, host_next, robots, seed_hosts)
                     finally:
                         self.active -= 1
                         q.task_done()
-                        self.emit()
+                        self.emit(current_domain=cur_host, q_size=q.qsize())
 
             tasks = [asyncio.create_task(worker()) for _ in range(workers)]
             while not self.stop_event.is_set():
