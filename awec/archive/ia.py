@@ -97,15 +97,25 @@ class IAUploader:
     def validate_destination(self, force=False):
         if not self.access_key or not self.secret_key:
             return False, "IA_CREDENTIALS_MISSING"
-        ok, msg = self.check_collection(force)
-        if not ok:
-            return False, msg
+        if self.collection:
+            ok, msg = self.check_collection(force)
+            if not ok:
+                return False, msg
+        else:
+            msg = "COLLECTION_OPTIONAL"
         item_ok, item_msg = self.check_item(force)
         if item_ok:
             return True, f"{msg} • {item_msg}"
         if item_msg.startswith("ITEM_NOT_FOUND:"):
             return True, f"{msg} • ITEM_MISSING_WILL_BE_CREATED: {self.identifier}"
         return False, item_msg
+
+    def validate_dry_run(self, metadata: dict, files: list) -> tuple[bool, str]:
+        for f in files:
+            p = Path(f)
+            if not p.exists():
+                return False, f"LOCAL_FILE_NOT_FOUND: {f}"
+        return self.validate_destination()
 
     def _metadata(self):
         md = {"mediatype": "data", "collection": self.collection}
