@@ -91,6 +91,7 @@ class AWECMainWindow(V11MainWindow):
                 wanted.append((key, button))
         language = getattr(self, "nav_v10", None)
         if language:
+            language.setText("🌐 Languages & Names")
             wanted.append(("language", language))
         resume = getattr(self, "nav_v12_resume", None)
         if not resume:
@@ -431,6 +432,14 @@ class AWECMainWindow(V11MainWindow):
         r = QPushButton("↻ Refresh Now"); r.clicked.connect(self._refresh_resume_list); row.addWidget(r)
         o = QPushButton("📂 Open TMPCRAWL"); o.clicked.connect(self._open_resume_storage); row.addWidget(o); row.addStretch(); l.addLayout(row)
         self.pages.addWidget(p); self._resume_page = p
+
+    def _page(self, k):
+        super()._page(k)
+        self._set_nav_selection(k)
+
+    def _page_v10_language(self):
+        super()._page_v10_language()
+        self._set_nav_selection("language")
 
     def _page_v12(self, key):
         if key == "archive":

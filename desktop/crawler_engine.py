@@ -101,6 +101,15 @@ class AWECrawler:
         self.mirror = SiteMirror(crawl_root / "site")
         self.indexer = SearchIndexer(self.store)
         self.link_graph = LinkGraphManager(self.store)
+        merged_headers = dict(policy.custom_headers or {})
+        if policy.auto_headers:
+            merged_headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            merged_headers.setdefault("Accept-Language", "en-US,en;q=0.9,hy;q=0.8,ru;q=0.7")
+            merged_headers.setdefault("Accept-Encoding", "gzip, deflate, br")
+            merged_headers.setdefault("Sec-Fetch-Dest", "document")
+            merged_headers.setdefault("Sec-Fetch-Mode", "navigate")
+            merged_headers.setdefault("Sec-Fetch-Site", "same-origin")
+            merged_headers.setdefault("Upgrade-Insecure-Requests", "1")
         core_policy = CorePolicy(
             user_agent=policy.fanti_custom_user_agent or "AWEC/12.0 (+https://github.com/ARARAT33/AWEC; archival crawler)",
             network_mode=policy.network_mode,
@@ -109,7 +118,7 @@ class AWECrawler:
             max_file_size=policy.max_file_size,
             verify_ssl=policy.verify_ssl,
             proxy_url=policy.proxy_url,
-            custom_headers=policy.custom_headers,
+            custom_headers=merged_headers,
             download_files=True,
             allowed_mime_types=["*"],
             global_concurrency=max(1, policy.workers),
@@ -124,7 +133,7 @@ class AWECrawler:
             user_agent_profile=policy.fanti_user_agent_profile,
             custom_user_agent=policy.fanti_custom_user_agent or core_policy.user_agent,
             header_profile=policy.fanti_header_profile,
-            custom_headers=policy.custom_headers,
+            custom_headers=merged_headers,
             min_delay=max(0.0, policy.fanti_min_delay),
             max_delay=max(policy.fanti_min_delay, policy.fanti_max_delay),
             initial_delay=max(0.0, policy.fanti_initial_delay),
@@ -164,6 +173,21 @@ class AWECrawler:
         self.stats = {"status": "AWEC Stopped", "pages": 0, "files": 0, "bytes": 0, "errors": 0,
                       "queued": 0, "enqueued": 0, "retries": 0, "mirrored": 0, "mirror_bytes": 0,
                       "discovered": 0, "rejected": 0, "active_domain": ""}
+
+    def get_headers(self) -> dict[str, str]:
+        if hasattr(self.fetcher, "get_effective_headers"):
+            headers = self.fetcher.get_effective_headers()
+        else:
+            headers = {"User-Agent": self.policy.fanti_custom_user_agent or USER_AGENT_POOL[0]}
+        if self.policy.auto_headers:
+            headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            headers.setdefault("Accept-Language", "en-US,en;q=0.9,hy;q=0.8,ru;q=0.7")
+            headers.setdefault("Accept-Encoding", "gzip, deflate, br")
+            headers.setdefault("Sec-Fetch-Dest", "document")
+            headers.setdefault("Sec-Fetch-Mode", "navigate")
+            headers.setdefault("Sec-Fetch-Site", "same-origin")
+            headers.setdefault("Upgrade-Insecure-Requests", "1")
+        return headers
 
     @staticmethod
     def _registrable_host(host: str) -> str:
