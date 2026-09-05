@@ -35,7 +35,7 @@ class Engine(QObject):
         identifier=re.sub(r"[^A-Za-z0-9_.-]+","-",raw_identifier).strip("-")[:100]
         if identifier != raw_identifier:
             self.log.emit(f"ℹ️ IA identifier normalized: {raw_identifier} → {identifier}")
-        uploader=IAUploader(self.cfg.ia_access_key,self.cfg.ia_secret_key,identifier,getattr(self.cfg,'ia_endpoint','https://s3.us.archive.org'),collection=getattr(self.cfg,'ia_collection',''),title=getattr(self.cfg,'ia_title','') or raw_identifier,creator=getattr(self.cfg,'ia_creator',''),description=getattr(self.cfg,'ia_description',''))
+        uploader=IAUploader(self.cfg.ia_access_key,self.cfg.ia_secret_key,identifier,getattr(self.cfg,'ia_endpoint','https://s3.us.archive.org'),collection=(getattr(self.cfg,'ia_collection','') or __import__('os').environ.get('AWEC_IA_COLLECTION','')).strip(),title=getattr(self.cfg,'ia_title','') or raw_identifier,creator=getattr(self.cfg,'ia_creator',''),description=getattr(self.cfg,'ia_description',''))
         # Existing items must not receive collection metadata on every PUT.
         item_ok,_=uploader.check_item()
         if item_ok:

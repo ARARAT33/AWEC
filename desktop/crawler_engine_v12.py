@@ -199,7 +199,7 @@ class ResumableAWECrawler(BaseCrawler):
         discovered = []
         if "html" in ct:
             self.indexer.index_resource(rec.id, res.final_url, item["domain"], body)
-            if self.policy.follow_links and item["depth"] < self.policy.max_depth:
+            if self.policy.follow_links and (self.policy.max_depth <= 0 or item["depth"] < self.policy.max_depth):
                 discovered = ContentExtractor.extract_html_links(res.final_url, body)
         elif "css" in ct:
             discovered = ContentExtractor.extract_css_links(res.final_url, body)

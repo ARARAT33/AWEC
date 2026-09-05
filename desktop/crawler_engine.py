@@ -176,10 +176,20 @@ class AWECrawler:
 
     def _in_scope(self, url: str, embedded_kind: str = "") -> bool:
         host = (urlparse(url).hostname or "").lower()
-        if not host: return False
-        if embedded_kind in self.EMBEDDED_RESOURCE_KINDS: return True
-        if self.policy.follow_external_domains: return True
-        return any(self._same_site(host, urlparse(seed).hostname or "") for seed in self.seeds)
+        if not host:
+            return False
+        if embedded_kind in self.EMBEDDED_RESOURCE_KINDS:
+            return True
+        if self.policy.follow_external_domains:
+            return True
+        for seed in self.seeds:
+            seed_host = (urlparse(seed).hostname or "").lower()
+            if self.policy.include_subdomains:
+                if self._same_site(host, seed_host):
+                    return True
+            elif self._registrable_host(host) == self._registrable_host(seed_host):
+                return True
+        return False
 
     def _should_queue(self, url: str, mime_hint: str = "", discovery_type: str = "") -> bool:
         if not self._in_scope(url, discovery_type): self.stats["rejected"] += 1; return False
@@ -227,7 +237,7 @@ class AWECrawler:
         body = res.decoded_bytes.decode("utf-8", errors="ignore"); discovered = []; ct = res.content_type.lower()
         if "html" in ct:
             self.indexer.index_resource(rec.id, res.final_url, item["domain"], body)
-            if self.policy.follow_links and item["depth"] < self.policy.max_depth: discovered = ContentExtractor.extract_html_links(res.final_url, body)
+            if self.policy.follow_links and (self.policy.max_depth <= 0 or item["depth"] < self.policy.max_depth): discovered = ContentExtractor.extract_html_links(res.final_url, body)
         elif "css" in ct: discovered = ContentExtractor.extract_css_links(res.final_url, body)
         elif "javascript" in ct or "ecmascript" in ct: discovered = ContentExtractor.extract_js_links(res.final_url, body)
         elif "xml" in ct or urlparse(res.final_url).path.lower().endswith((".xml", ".xml.gz")): discovered = [(u, "sitemap_url", "text/html") for u in ContentExtractor.parse_sitemap(payload, res.final_url.lower().endswith(".gz"))]
