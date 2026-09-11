@@ -26,12 +26,12 @@ from urllib.parse import urlparse, urljoin
 import aiohttp
 from bs4 import BeautifulSoup
 from PySide6.QtCore import Qt, QThread, Signal, Slot
-from PySide6.QtGui import QFont, QColor, QPalette
+from PySide6.QtGui import QAction, QFont, QColor, QPalette
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QSpinBox, QTextEdit, QFileDialog,
     QMessageBox, QProgressBar, QGroupBox, QComboBox, QSplitter,
-    QFrame, QScrollArea, QStatusBar, QToolBar, QAction
+    QFrame, QScrollArea, QStatusBar, QToolBar
 )
 
 from awec.storage.awec_archive import AWECSecurity
