@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 from PySide6.QtWidgets import QApplication
 
-from desktop.app_window_v12 import AWECMainWindow
+from desktop.app_window_v12 import AWECDesktopV12 as AWECMainWindow
 from desktop.theme import apply_theme
 
 
