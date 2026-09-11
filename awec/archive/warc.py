@@ -14,13 +14,14 @@ from awec.core.canonicalizer import ResourceRecord
 
 
 class WARCGenerator:
-    def __init__(self, warc_dir: Path | str, crawl_id: str):
+    def __init__(self, warc_dir: Path | str, crawl_id: str, compression_level: int = 6):
         self.warc_dir = Path(warc_dir)
         self.warc_dir.mkdir(parents=True, exist_ok=True)
         self.crawl_id = crawl_id
+        self.compression_level = compression_level
         self.warc_path = self.warc_dir / f"AWEC-{crawl_id}.warc.gz"
         self._f = open(self.warc_path, "wb")
-        self.writer = WARCWriter(self._f, gzip=True)
+        self.writer = WARCWriter(self._f, gzip=True, compresslevel=compression_level)
 
     def write_warc_response(self, rec: ResourceRecord, wire_payload: bytes) -> Tuple[int, int]:
         offset = self._f.tell()
@@ -57,14 +58,18 @@ class WARCGenerator:
 
 
 class ArchivePackageBuilder:
-    def __init__(self, archive_dir: Path | str, crawl_id: str, seed_url: str):
+    def __init__(self, archive_dir: Path | str, crawl_id: str, seed_url: str, awec_config=None):
         self.archive_dir = Path(archive_dir)
         self.archive_dir.mkdir(parents=True, exist_ok=True)
         self.crawl_id = crawl_id
         self.seed_url = seed_url
+        self.awec_config = awec_config
 
     def build_package(self, records: List[ResourceRecord], started_at: str, finished_at: str) -> Path:
-        manifest_data = {
+        # Generate AWEC-format metadata
+        awec_metadata = {
+            "format": "awec",
+            "version": self.awec_config.awec_format_version if self.awec_config else "1.0",
             "crawl_id": self.crawl_id,
             "seed": self.seed_url,
             "started_at": started_at,
@@ -72,21 +77,36 @@ class ArchivePackageBuilder:
             "total_resources": len(records),
             "successful_resources": sum(1 for r in records if 200 <= r.status < 400),
             "failed_resources": sum(1 for r in records if r.status >= 400 or r.error),
+            "total_wire_bytes": sum(r.wire_size for r in records),
+            "total_decoded_bytes": sum(r.decoded_size for r in records),
+            "unique_content_hashes": len(set(r.sha256_wire for r in records if r.sha256_wire)),
+            "deduplication_enabled": self.awec_config.enable_deduplication if self.awec_config else True,
+            "compression_level": self.awec_config.compression_level if self.awec_config else 6,
             "resources": [
                 {
+                    "id": r.id,
                     "url": r.final_url,
                     "requested_url": r.requested_url,
+                    "canonical_url": r.canonical_url,
+                    "parent_url": r.parent_url,
+                    "discovery_type": r.discovery_type,
                     "status": r.status,
                     "content_type": r.content_type,
                     "wire_size": r.wire_size,
+                    "decoded_size": r.decoded_size,
                     "sha256_wire": r.sha256_wire,
                     "sha256_decoded": r.sha256_decoded,
-                    "archive_path": r.archive_path,
+                    "sha512_wire": r.sha512_wire,
+                    "sha512_decoded": r.sha512_decoded,
+                    "downloaded_at": r.downloaded_at,
+                    "duration_ms": r.duration_ms,
                     "warc": {
                         "file": r.warc_file,
                         "offset": r.warc_offset,
                         "length": r.warc_length
                     },
+                    "challenge_detected": r.challenge_detected,
+                    "network_mode": r.network_mode,
                     "error": r.error
                 }
                 for r in records
@@ -94,7 +114,7 @@ class ArchivePackageBuilder:
         }
 
         manifest_file = self.archive_dir / "manifest.json"
-        manifest_file.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
+        manifest_file.write_text(json.dumps(awec_metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
         # Report HTML
         report_html = f"""<!DOCTYPE html>
@@ -105,6 +125,9 @@ class ArchivePackageBuilder:
 <p><strong>Crawl ID:</strong> {self.crawl_id}</p>
 <p><strong>Seed:</strong> {self.seed_url}</p>
 <p><strong>Total Resources:</strong> {len(records)}</p>
+<p><strong>Successful:</strong> {sum(1 for r in records if 200 <= r.status < 400)}</p>
+<p><strong>Failed:</strong> {sum(1 for r in records if r.status >= 400)}</p>
+<p><strong>Total Data:</strong> {sum(r.wire_size for r in records) / (1024*1024):.2f} MB</p>
 </body>
 </html>"""
         (self.archive_dir / "crawl-report.html").write_text(report_html, encoding="utf-8")

@@ -1,0 +1,44 @@
+{
+  "format": "awec",
+  "version": "1.0",
+  "crawl_id": "crawl-4c8b2c4d33",
+  "seed": "https://example.com",
+  "started_at": "2026-09-11T17:27:50.757079+00:00",
+  "finished_at": "2026-09-11T17:27:50.809031+00:00",
+  "total_resources": 1,
+  "successful_resources": 1,
+  "failed_resources": 0,
+  "total_wire_bytes": 559,
+  "total_decoded_bytes": 559,
+  "unique_content_hashes": 1,
+  "deduplication_enabled": true,
+  "compression_level": 6,
+  "resources": [
+    {
+      "id": "2197c62e8ea24d8db90f5d473bf32cb1",
+      "url": "https://example.com",
+      "requested_url": "https://example.com",
+      "canonical_url": "https://example.com/",
+      "parent_url": "",
+      "discovery_type": "seed",
+      "status": 200,
+      "content_type": "",
+      "wire_size": 559,
+      "decoded_size": 559,
+      "sha256_wire": "ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d",
+      "sha256_decoded": "ff67a9d764d6a2367a187734e697f6a53217db9a21c101d410a113ca871a299d",
+      "sha512_wire": "",
+      "sha512_decoded": "",
+      "downloaded_at": "2026-09-11T17:27:50.805493+00:00",
+      "duration_ms": 44.785499572753906,
+      "warc": {
+        "file": "AWEC-crawl-4c8b2c4d33.warc.gz",
+        "offset": 0,
+        "length": 848
+      },
+      "challenge_detected": false,
+      "network_mode": "standard",
+      "error": ""
+    }
+  ]
+}
