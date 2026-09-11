@@ -1,0 +1,26 @@
+{
+  "internet_archive": {
+    "access_key": "",
+    "secret_key": "",
+    "collection": "awec_archives",
+    "endpoint": "https://s3.us.archive.org",
+    "auto_upload": false,
+    "max_concurrent_uploads": 4
+  },
+  "archive": {
+    "format_version": "1.0",
+    "compression_level": 6,
+    "deduplication": true
+  },
+  "crawl": {
+    "default_max_depth": 8,
+    "default_scope": "same_origin",
+    "default_network_mode": "standard"
+  },
+  "performance": {
+    "concurrency_per_host": 4,
+    "global_concurrency": 32,
+    "request_timeout": 30,
+    "max_retries": 8
+  }
+}
