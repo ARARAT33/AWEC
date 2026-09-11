@@ -1,13 +1,1 @@
-.venv/
-__pycache__/
-*.pyc
-AWEC/
-dataset/
-html/
-logs/
-checkpoints/
-*.db
-*.sqlite
-.env
-fallback/
-awec-state/
+Nothing needs to be added to .gitignore since the changes only include Python source files (.py) which are not build artifacts, dependencies, or temporary files.
